@@ -1,0 +1,13 @@
+[package]
+name = "integration-tests"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+datafusion-common = { path = "./datafusion/datafusion/common" }
+datafusion-expr = { path = "./datafusion/datafusion/expr" }
+datafusion-execution = { path = "./datafusion/datafusion/execution" }
+datafusion-catalog = { path = "./datafusion/datafusion/catalog" }
+datafusion = { path = "./datafusion/datafusion/core" }
+test-utils = { path = "./datafusion/test-utils" }
+tokio = { version = "1.44.2", features = ["full"] }

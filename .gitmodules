@@ -1,0 +1,3 @@
+[submodule "datafusion"]
+	path = integration-tests/datafusion
+	url = https://github.com/apache/datafusion.git
