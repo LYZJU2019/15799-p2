@@ -8,7 +8,7 @@ To build and run the main CLI tool, run
 ```sh
 cd optdbg
 cargo build 
-./target/debug/optdbg -q my_query.sql
+./target/debug/optdbg -o dolomite -q my_query.sql
 ```
 
 To check integration tests, run
