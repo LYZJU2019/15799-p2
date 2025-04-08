@@ -3,6 +3,14 @@ name = "integration-tests"
 version = "0.1.0"
 edition = "2021"
 
+[[bin]]
+name = "test"
+path = "src/test.rs"
+
+[[bin]]
+name = "runner"
+path = "src/runner.rs"
+
 [dependencies]
 datafusion-common = { path = "./datafusion/datafusion/common" }
 datafusion-expr = { path = "./datafusion/datafusion/expr" }

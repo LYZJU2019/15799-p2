@@ -1,0 +1,13 @@
+diff --git a/datafusion/physical-plan/src/filter.rs b/datafusion/physical-plan/src/filter.rs
+index a8a9973ea..eee18b27e 100644
+--- a/datafusion/physical-plan/src/filter.rs
++++ b/datafusion/physical-plan/src/filter.rs
+@@ -84,7 +84,7 @@ impl FilterExec {
+     ) -> Result<Self> {
+         match predicate.data_type(input.schema().as_ref())? {
+             DataType::Boolean => {
+-                let default_selectivity = 20;
++                let default_selectivity = 90;
+                 let cache = Self::compute_properties(
+                     &input,
+                     &predicate,

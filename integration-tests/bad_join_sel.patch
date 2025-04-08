@@ -1,0 +1,13 @@
+diff --git a/datafusion/physical-plan/src/joins/utils.rs b/datafusion/physical-plan/src/joins/utils.rs
+index 5516f172d..325848356 100644
+--- a/datafusion/physical-plan/src/joins/utils.rs
++++ b/datafusion/physical-plan/src/joins/utils.rs
+@@ -569,7 +569,7 @@ fn estimate_inner_join_cardinality(
+             return None;
+         }
+ 
+-        let left_max_distinct = max_distinct_count(&left_stats.num_rows, left_stat);
++        let left_max_distinct = max_distinct_count(&right_stats.num_rows, left_stat);
+         let right_max_distinct = max_distinct_count(&right_stats.num_rows, right_stat);
+         let max_distinct = left_max_distinct.max(&right_max_distinct);
+         if max_distinct.get_value().is_some() {
