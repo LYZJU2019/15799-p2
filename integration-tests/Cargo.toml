@@ -19,3 +19,4 @@ datafusion-catalog = { path = "./datafusion/datafusion/catalog" }
 datafusion = { path = "./datafusion/datafusion/core" }
 test-utils = { path = "./datafusion/test-utils" }
 tokio = { version = "1.44.2", features = ["full"] }
+optdbg = { path = "../optdbg" }

@@ -58,11 +58,8 @@ LIMIT 1;
 	let (st, pl) = df.into_parts();
 	let pl = st.optimize(&pl)?;
 	let phys = st.create_physical_plan(&pl).await?;
-
-    println!(
-        "Physical Plan:\n\n{:?}\n",
-        phys.statistics()
-    );
-   
+	
+	optdbg::benchmark::benchmark(vec![unsafe { std::mem::transmute(phys) }]);
+	
     Ok(())
 }

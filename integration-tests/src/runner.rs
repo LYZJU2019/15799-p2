@@ -14,6 +14,13 @@ fn main() {
 		("bad_join_sel", 0),
 	];
 
+	run_command(
+		Command::new("git")
+			.arg("reset").arg("--hard").arg("HEAD")
+			.current_dir(Path::new("./datafusion")),
+		"revert any left over changes"
+	);
+	
 	for test in tests {
 		run_command(
 			Command::new("git")
@@ -31,9 +38,12 @@ fn main() {
 
 		println!("Running test with patch '{}'...", test.0);
 		let output = Command::new("./target/debug/test")
+			.stdout(Stdio::null())
 			.output().expect("failed to execute test");
 		if !output.status.success() {
+			eprintln!("{}", String::from_utf8_lossy(&output.stderr));
 			panic!("Test '{}' failed.", test.0);
+			
 		}
 		let output = String::from_utf8(output.stdout)
 			.expect("bad UTF-8 in test output");
