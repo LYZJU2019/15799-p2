@@ -4,3 +4,9 @@
 [submodule "integration-tests/datafusion"]
 	path = integration-tests/datafusion
 	url = https://github.com/apache/datafusion.git
+[submodule "ext/AutoDI"]
+	path = ext/AutoDI
+	url = https://github.com/rmitbggroup/AutoDI
+[submodule "ext/taqo"]
+	path = ext/taqo
+	url = https://github.com/qvad/taqo
