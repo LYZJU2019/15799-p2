@@ -2,6 +2,8 @@
 > query optimizer debugger
 
 ## usage 
+First, run `git submodule update --init --recursive` if you didn't clone with the submodules already!
+
 To build and run the main CLI tool, run
 ```sh
 cd optdbg
