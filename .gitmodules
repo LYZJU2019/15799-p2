@@ -7,3 +7,9 @@
 [submodule "ext/taqo"]
 	path = ext/taqo
 	url = https://github.com/qvad/taqo
+[submodule "optdbg/optd"]
+	path = optdbg/optd
+	url = git@github.com:quantumish/optd.git
+[submodule "optdbg/datafusion-dolomite"]
+	path = optdbg/datafusion-dolomite
+	url = git@github.com:quantumish/datafusion-dolomite.git

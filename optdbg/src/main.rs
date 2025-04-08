@@ -6,6 +6,8 @@ mod sampling;
 mod benchmark;
 mod analysis;
 
+use sampling::OptimizerBackend;
+
 /// Query optimizer debugger.
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -15,13 +17,15 @@ struct Args {
     query_path: String,
 }
 
-fn main() {
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 	let query = std::fs::read_to_string(
 		Path::new(&args.query_path)
 	).expect("read query from file");
-	let plans = sampling::sample(query);
+	let plans = sampling::sample(query, OptimizerBackend::Optd).await?;
 	let (notable_plans, metrics) = benchmark::benchmark(plans);
 	let report = analysis::analyze(notable_plans, metrics);
 	println!("{report}");
+	Ok(())
 }
