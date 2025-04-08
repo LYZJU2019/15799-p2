@@ -9,6 +9,6 @@ pub async fn report_query(
 	opt: sampling::OptimizerBackend
 ) -> Result<analysis::Report> {
 	let plans = sampling::sample(query, opt).await?;
-	let (notable_plans, metrics) = benchmark::benchmark(plans);
-	Ok(analysis::analyze(notable_plans, metrics))
+	let bench = benchmark::benchmark(plans).await?;
+	Ok(analysis::analyze(bench.notable_plans, bench.metrics))
 }
