@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use datafusion::physical_plan::ExecutionPlan;
 
-use crate::benchmark::OptimizerMetrics;
+use crate::benchmark::BenchmarkOutput;
 
 // Placeholder type.
 pub struct Report;
@@ -12,9 +12,6 @@ impl std::fmt::Display for Report {
 	}
 }
 
-pub fn analyze(
-	_card_plans: Vec<(Arc<dyn ExecutionPlan>, Vec<usize>)>,
-	_metrics: OptimizerMetrics
-) -> Report {
+pub fn analyze(_bench: BenchmarkOutput) -> Report {
 	todo!()
 }

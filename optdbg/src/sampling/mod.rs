@@ -25,9 +25,20 @@ impl std::str::FromStr for OptimizerBackend {
 	}
 }
 
+pub struct Plan {
+	pub tree: Arc<dyn ExecutionPlan>,
+	pub est_cost: f64,
+}
+
+impl Plan {
+	fn new(tree: Arc<dyn ExecutionPlan>, est_cost: f64) -> Self {
+		Self { tree, est_cost } 
+	}
+}
+
 pub struct SampleOutput {
-	pub best_plan: Arc<dyn ExecutionPlan>,
-	pub alternates: Vec<Arc<dyn ExecutionPlan>>,
+	pub best_plan: Plan,
+	pub alternates: Vec<Plan>,
 	pub session: SessionState,
 }
 
@@ -50,7 +61,7 @@ pub async fn sample(query: String, opt: OptimizerBackend) -> Result<SampleOutput
 			let out_plan = dolomite_conversion::to_df_logical(&best_plan)?;
 			let phys_plan = st.create_physical_plan(&out_plan).await?;
 			Ok(SampleOutput {
-				best_plan: phys_plan,
+				best_plan: Plan::new(phys_plan, 0.0),
 				alternates: Vec::new(),
 				session: st,
 			})

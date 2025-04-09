@@ -19,6 +19,10 @@ struct Args {
 	/// Optimizer to evaluate
 	#[arg(short, long)]
     optimizer: OptimizerBackend,
+
+	/// Whether to avoid running all subplans of a plan
+	#[arg(short, long)]
+	fast: bool
 }
 
 #[tokio::main]
