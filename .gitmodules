@@ -13,3 +13,6 @@
 [submodule "optdbg/datafusion-dolomite"]
 	path = optdbg/datafusion-dolomite
 	url = git@github.com:quantumish/datafusion-dolomite.git
+[submodule "optdbg/optd-original"]
+	path = optdbg/optd-original
+	url = git@github.com:quantumish/optd-original.git

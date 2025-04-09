@@ -93,6 +93,7 @@ Primary configuration knobs include:
 - Which optimizer backend to test
 - How large of a sample should be collected
 - Whether true cardinalities should be measured for every subplan
+- Timeout to use for benchmarking
 - Desired "extra" measurements/analyses (e.g. optimizer sensitivity)
 
 ## Design Rationale

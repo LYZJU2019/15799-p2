@@ -11,6 +11,7 @@ use anyhow::Result;
 #[derive(Clone, Debug)]
 pub enum OptimizerBackend {
 	Optd,
+	OptdOld,
 	Dolomite,
 }
 
@@ -19,6 +20,7 @@ impl std::str::FromStr for OptimizerBackend {
 	fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
 		match s.to_lowercase().as_str() {
 			"optd" => Ok(OptimizerBackend::Optd),
+			"optd-old" => Ok(OptimizerBackend::OptdOld),
 			"dolomite" => Ok(OptimizerBackend::Dolomite),
 			_ => Err("unknown backend")
 		}
@@ -54,6 +56,9 @@ pub async fn sample(query: String, opt: OptimizerBackend) -> Result<SampleOutput
 			// use mockmemo?
 			todo!()
 		},
+		OptimizerBackend::OptdOld => {
+			todo!()
+		}
 		OptimizerBackend::Dolomite => {
 			let plan = dolomite_conversion::from_df_logical(&pl)?;
 			let opt = dolomite::cascades::CascadesOptimizer::default(plan);

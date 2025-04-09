@@ -10,6 +10,7 @@ datafusion = "45"
 optd-core = { path = "./optd/optd-core" }
 chrono = "0.4.39"
 optd-datafusion = { path = "./optd/optd-datafusion" }
+optd_og-datafusion-bridge = { path = "./optd-original/optd_og-datafusion-bridge" }
 tokio = { version = "1.44.2", features = ["full"] }
 dolomite = { path = "./datafusion-dolomite/dolomite" }
 datafusion-dolomite-integration = { path = "./datafusion-dolomite/datafusion-dolomite-integration/" }
