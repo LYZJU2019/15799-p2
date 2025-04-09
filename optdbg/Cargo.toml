@@ -14,5 +14,6 @@ optd_og-datafusion-bridge = { path = "./optd-original/optd_og-datafusion-bridge"
 tokio = { version = "1.44.2", features = ["full"] }
 dolomite = { path = "./datafusion-dolomite/dolomite" }
 datafusion-dolomite-integration = { path = "./datafusion-dolomite/datafusion-dolomite-integration/" }
+async-recursion = "1.1.1"
 
 
