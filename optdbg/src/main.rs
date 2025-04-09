@@ -20,7 +20,7 @@ struct Args {
 	#[arg(short, long)]
     optimizer: OptimizerBackend,
 
-	/// Whether to avoid running all subplans of a plan
+	/// Avoid running all subplans of a plan
 	#[arg(short, long)]
 	fast: bool
 }
@@ -33,7 +33,7 @@ async fn main() -> anyhow::Result<()> {
 	).expect("read query from file");
 	let plans = sampling::sample(query, OptimizerBackend::Optd).await?;
 	let bench = benchmark::benchmark(plans).await?;
-	let report = analysis::analyze(bench.notable_plans, bench.metrics);
+	let report = analysis::analyze(bench);
 	println!("{report}");
 	Ok(())
 }
