@@ -11,9 +11,5 @@ cargo build
 ./target/debug/optdbg -o dolomite -q my_query.sql
 ```
 
-To check integration tests, run
-```sh
-cd integration-tests
-cargo run --bin runner
-```
-
+## tests
+See the README in `integration_tests/`!

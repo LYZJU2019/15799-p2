@@ -1,0 +1,10 @@
+# target directories
+*/target
+
+# data files
+*.tbl
+
+# emacs files
+*~
+\#*\#
+.\#*
