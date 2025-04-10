@@ -11,15 +11,19 @@ use sampling::{SampleConfig, OptimizerBackend};
 use benchmark::BenchmarkConfig;
 use analysis::AnalysisConfig;
 
-impl std::str::FromStr for Duration {
+// Get around inability to implement foreign trait for foreign type.
+#[derive(Clone, Debug)]
+struct TimeoutTime(Duration);
+
+impl std::str::FromStr for TimeoutTime {
 	type Err = &'static str;
 	fn from_str(s: &str) -> Result<Self, Self::Err> {
-		let num_portion = s.chars().take_while(|x| *x.is_numeric()).collect();
-		let num = usize::from_str(&num_portion).map_err(|_| "bad number")?;
-		match &s.chars().filter(|x| !*x.is_numeric()).collect() {
-			"s" => Ok(Duration::from_secs(num)),
-			"m" => Ok(Duration::from_secs(num * 60)),
-			"h" => Ok(Duration::from_secs(num * 60 * 60)),
+		let num_portion: String = s.chars().take_while(|x| x.is_numeric()).collect();
+		let num = u64::from_str(&num_portion).map_err(|_| "bad number")?;
+		match s.chars().filter(|x| !x.is_numeric()).collect::<String>().as_str() {
+			"s" => Ok(TimeoutTime(Duration::from_secs(num))),
+			"m" => Ok(TimeoutTime(Duration::from_secs(num * 60))),
+			"h" => Ok(TimeoutTime(Duration::from_secs(num * 60 * 60))),
 			_ => Err("bad suffix")
 		}
 	}
@@ -43,18 +47,18 @@ struct Args {
 
 	/// Timeout to use for benchmarking ([0-9]+(m|s|h))
 	#[arg(short, long)]
-	timeout: Option<Duration>	
+	timeout: Option<TimeoutTime>	
 }
 
 impl Args {
-	fn to_parts(self) -> (SampleConfig, BenchmarkConfig, AnalysisConfig) {
+	fn to_configs(self) -> (SampleConfig, BenchmarkConfig, AnalysisConfig) {
 		(
 			SampleConfig {
 				backend: self.optimizer
 			},
 			BenchmarkConfig {
-				timeout: self.timeout,
-				fast: self.fast,				
+				timeout: self.timeout.map(|x| x.0),
+				fast: self.fast,
 			},
 			AnalysisConfig
 		)
@@ -63,10 +67,11 @@ impl Args {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let (s_cfg, b_cfg, a_cfg) = Args::parse().to_parts();
+    let args = Args::parse();
 	let query = std::fs::read_to_string(
 		Path::new(&args.query_path)
 	).expect("read query from file");
+	let (s_cfg, b_cfg, a_cfg) = args.to_configs();
 	let plans = sampling::sample(query, s_cfg).await?;
 	let bench = benchmark::benchmark(plans, b_cfg).await?;
 	let report = analysis::analyze(bench, a_cfg);

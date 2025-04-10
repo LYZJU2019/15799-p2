@@ -5,8 +5,8 @@ use datafusion::physical_plan::ExecutionPlan;
 use datafusion::execution::context::{SessionConfig, SessionContext};
 use dolomite::optimizer::Optimizer;
 use datafusion_dolomite_integration::conversion as dolomite_conversion;
-use optd_datafusion::df_conversion::context::OptdDFContext;
 use anyhow::Result;
+use optd_og_datafusion_bridge::OptdPlanContext;
 
 #[derive(Clone, Debug)]
 pub enum OptimizerBackend {
@@ -55,12 +55,14 @@ pub async fn sample(query: String, cfg: SampleConfig) -> Result<SampleOutput> {
 	let (st, pl) = df.into_parts();
 	match cfg.backend {
 		OptimizerBackend::Optd => {
+			use optd_datafusion::df_conversion::context::OptdDFContext;
 			let mut opt_ctx = OptdDFContext::new(&st);
 			let _plan = opt_ctx.df_to_optd_relational(&pl);
-			// use mockmemo?
-			todo!()
+			todo!("There isn't really a way to run new optd yet.")
 		},
 		OptimizerBackend::OptdOld => {
+			let mut opt_ctx = OptdPlanContext::new(&st);
+			let _plan = opt_ctx.conv_into_optd_og(&pl);			
 			todo!()
 		}
 		OptimizerBackend::Dolomite => {

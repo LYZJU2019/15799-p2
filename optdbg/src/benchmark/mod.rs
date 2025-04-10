@@ -15,9 +15,10 @@ pub struct BenchmarkConfig {
 // placeholder type
 pub struct OptimizerMetrics;
 
+/// Plan annotated with runtimes / cardinalities.
 pub struct MeasuredPlan {
 	pub plan: Plan,
-	/// Time it took to run the plan.
+	/// Time it took to run the overall plan.
 	pub runtime: Duration,
 	/// Preorder array of each subplan's true cardinality.
 	pub cardinalities: Vec<usize>,
@@ -34,6 +35,14 @@ pub struct BenchmarkOutput {
 	pub metrics: OptimizerMetrics,
 }
 
+/// Recursively populate cardinality and runtime arrays.
+// TODO need to be a *lot* more rigorous for the actual benchmarking here.
+// one option is to try and integrate an existing optimizer like criterion
+// or divan. Both of these don't really support usage as a library though...
+// Doing this properly is an easy way to surpass TAQO.
+//
+// The other major TODO (this is long term) is to support the `fast` option 
+// and implement the optimization in www.vldb.org/pvldb/vol2/vldb09-294.pdf
 #[async_recursion]
 async fn measure_subplan(
 	node: Arc<dyn ExecutionPlan>,
@@ -58,6 +67,7 @@ async fn measure_subplan(
 	Ok(())
 }
 
+/// Measure cardinalities and runtimes of plan and subplans.
 async fn measure_plan(
 	plan: Plan,
 	ctx: Arc<TaskContext>,
@@ -86,6 +96,8 @@ pub async fn benchmark(sample: SampleOutput, cfg: BenchmarkConfig) -> Result<Ben
 	out.sort_by(|x, y| x.runtime.cmp(&y.runtime));
 	let chosen_idx = out.iter()
 		.position(|x| x.runtime > best.runtime).unwrap_or(out.len());
+
+	// TODO actually measure metrics
 	
 	Ok(BenchmarkOutput {
 		plans: out,
