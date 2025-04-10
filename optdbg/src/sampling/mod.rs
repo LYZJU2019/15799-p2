@@ -1,5 +1,8 @@
 use std::sync::Arc;
 
+use datafusion::arrow::datatypes::Schema;
+use datafusion::catalog::{CatalogProvider, CatalogProviderList, MemoryCatalogProvider, MemoryCatalogProviderList, MemorySchemaProvider, SchemaProvider};
+use datafusion::datasource::MemTable;
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::execution::SessionState;
 use datafusion::physical_plan::ExecutionPlan;
@@ -51,10 +54,18 @@ pub struct SampleOutput {
 	pub session: SessionState,
 }
 
-pub async fn sample(query: String, cfg: SampleConfig) -> Result<SampleOutput> {
+pub struct QueryInfo {
+	pub query: String,
+	pub tables: Vec<(String, Arc<MemTable>)>,
+}
+
+pub async fn sample(query: QueryInfo, cfg: SampleConfig) -> Result<SampleOutput> {
 	let config = SessionConfig::default();
-    let df_ctx = SessionContext::new_with_config(config);
-	let df = df_ctx.sql(&query).await?;
+	let df_ctx = SessionContext::new_with_config(config);
+	for (name, table) in &query.tables {
+		df_ctx.register_table(name, table.clone())?;
+	}
+	let df = df_ctx.sql(&query.query).await?;
 	let (st, pl) = df.into_parts();
 	match cfg.backend {
 		OptimizerBackend::Optd => {
@@ -67,11 +78,22 @@ pub async fn sample(query: String, cfg: SampleConfig) -> Result<SampleOutput> {
 			let mut opt_ctx = OptdPlanContext::new(&st);
 			let plan = opt_ctx.conv_into_optd_og(&pl)?;
 			let rt_config = RuntimeEnvBuilder::new();
-			let session_config = SessionConfig::from_env()?.with_information_schema(true);
+			let session_config = SessionConfig::from_env()?
+				.with_information_schema(true)
+				.with_create_default_catalog_and_schema(false);
+			let schem_prov = MemorySchemaProvider::new();
+			for (name, table) in query.tables {
+				schem_prov.register_table(name, table.clone())?;
+			}
+			let mem_prov = MemoryCatalogProvider::new();
+			mem_prov.register_schema("public", Arc::new(schem_prov))?;
+			let mem_prov_list = MemoryCatalogProviderList::new();
+			mem_prov_list.register_catalog("datafusion".to_string(), Arc::new(mem_prov));
+			
 			let df_ctx = optd_og_datafusion_bridge::create_df_context(
 				Some(session_config.clone()),
 				Some(rt_config.clone()),
-				None,
+				Some(Arc::new(mem_prov_list)),
 				false,
 				false,
 				true,
@@ -86,6 +108,8 @@ pub async fn sample(query: String, cfg: SampleConfig) -> Result<SampleOutput> {
 			let winfo = opt.cascades_optimizer.memo.get_group_winner(gid)
 				.as_full_winner().unwrap();
 			let cost = winfo.total_cost.0[COMPUTE_COST];
+
+			// TODO actually sample alternates
 			
 			Ok(SampleOutput {
 				best_plan: Plan::new(phys_plan, cost),
@@ -96,12 +120,22 @@ pub async fn sample(query: String, cfg: SampleConfig) -> Result<SampleOutput> {
 		OptimizerBackend::Dolomite => {
 			let plan = dolomite_conversion::from_df_logical(&pl)?;
 			let mut opt = dolomite::cascades::CascadesOptimizer::default(plan);
+			opt.rules.extend(vec![
+				dolomite::rules::Join2HashJoinRule::new().into(),
+				dolomite::rules::PushLimitOverProjectionRule::new().into(),
+				dolomite::rules::PushLimitToTableScanRule::new().into(),
+				dolomite::rules::RemoveLimitRule::new().into(),
+				dolomite::rules::Scan2TableScanRule::new().into(),
+			]);
+
 			let best_plan = opt.find_best_plan()?;
 			let out_plan = dolomite_conversion::to_df_logical(&best_plan)?;
 			let phys_plan = st.create_physical_plan(&out_plan).await?;
 			let cost = opt.memo.groups.get(&opt.memo.root_group_id)
 				.unwrap().winner(&opt.required_prop)
 				.unwrap().lowest_cost.0;
+
+			// TODO actually sample alternates			
 			Ok(SampleOutput {
 				best_plan: Plan::new(phys_plan, cost),
 				alternates: Vec::new(),

@@ -76,6 +76,7 @@ async fn measure_plan(
 	let mut cardinalities = Vec::new();
 	let mut runtimes = Vec::new();
 	measure_subplan(plan.tree.clone(), ctx, cfg, &mut cardinalities, &mut runtimes).await?;
+	println!("{}ms", runtimes[0].as_millis());
 	Ok(MeasuredPlan {
 		plan,
 		runtime: runtimes[0],
@@ -96,7 +97,8 @@ pub async fn benchmark(sample: SampleOutput, cfg: BenchmarkConfig) -> Result<Ben
 	out.sort_by(|x, y| x.runtime.cmp(&y.runtime));
 	let chosen_idx = out.iter()
 		.position(|x| x.runtime > best.runtime).unwrap_or(out.len());
-
+	out.insert(chosen_idx, best);
+	
 	// TODO actually measure metrics
 	
 	Ok(BenchmarkOutput {

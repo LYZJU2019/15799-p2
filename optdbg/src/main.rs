@@ -7,7 +7,7 @@ mod sampling;
 mod benchmark;
 mod analysis;
 
-use sampling::{SampleConfig, OptimizerBackend};
+use sampling::{OptimizerBackend, QueryInfo, SampleConfig};
 use benchmark::BenchmarkConfig;
 use analysis::AnalysisConfig;
 
@@ -72,6 +72,10 @@ async fn main() -> anyhow::Result<()> {
 		Path::new(&args.query_path)
 	).expect("read query from file");
 	let (s_cfg, b_cfg, a_cfg) = args.to_configs();
+	let query = QueryInfo {
+		query,
+		tables: todo!("figure out interface for accessing db")
+	};
 	let plans = sampling::sample(query, s_cfg).await?;
 	let bench = benchmark::benchmark(plans, b_cfg).await?;
 	let report = analysis::analyze(bench, a_cfg);
