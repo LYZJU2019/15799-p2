@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::{Instant, Duration};
 
 use datafusion::{execution::TaskContext, physical_plan::{collect, ExecutionPlan}};
 use anyhow::Result;
@@ -6,24 +7,26 @@ use async_recursion::async_recursion;
 
 use crate::sampling::{Plan, SampleOutput};
 
-// placeholder type
-pub struct OptimizerMetrics {
-	pub optimality: f32,
-	pub efficiency: f32,
+pub struct BenchmarkConfig {
+	pub fast: bool,
+	pub timeout: Option<Duration>,
 }
+
+// placeholder type
+pub struct OptimizerMetrics;
 
 pub struct MeasuredPlan {
 	pub plan: Plan,
 	/// Time it took to run the plan.
-	pub runtime: chrono::Duration,
+	pub runtime: Duration,
 	/// Preorder array of each subplan's true cardinality.
 	pub cardinalities: Vec<usize>,
 	/// Preorder array of each subplan's runtime.
-	pub sub_runtimes: Option<Vec<chrono::Duration>>,
+	pub sub_runtimes: Option<Vec<Duration>>,
 }
 
 pub struct BenchmarkOutput {
-	/// Sorted by runtime.
+	/// Sorted by runtime (fastest at front).
 	pub plans: Vec<MeasuredPlan>,
 	/// Index of the chosen plan in the `plans` field.
 	pub chosen_idx: usize,
@@ -35,24 +38,34 @@ pub struct BenchmarkOutput {
 async fn measure_subplan(
 	node: Arc<dyn ExecutionPlan>,
 	ctx: Arc<TaskContext>,
+	cfg: &BenchmarkConfig,
 	cards: &mut Vec<usize>,
-	times: &mut Vec<chrono::Duration>
+	times: &mut Vec<Duration>
 ) -> Result<()> {
-	let before = chrono::Local::now();
-	let batches = collect(node.clone(), ctx.clone()).await?;
-	let after = chrono::Local::now();
+	let future = collect(node.clone(), ctx.clone());
+	let before = Instant::now();
+	let batches = if let Some(timeout) = cfg.timeout {
+		tokio::time::timeout(timeout, future).await??
+	} else {
+		future.await?
+	};
+	let after = Instant::now();
 	cards.push(batches.iter().map(|x| x.num_rows()).sum());
 	times.push(after-before);
 	for child in node.children() {
-		measure_subplan(child.clone(), ctx.clone(), cards, times).await?;
+		measure_subplan(child.clone(), ctx.clone(), cfg, cards, times).await?;
 	}
 	Ok(())
 }
 
-async fn measure_plan(plan: Plan, ctx: Arc<TaskContext>) -> Result<MeasuredPlan> {
+async fn measure_plan(
+	plan: Plan,
+	ctx: Arc<TaskContext>,
+	cfg: &BenchmarkConfig,
+) -> Result<MeasuredPlan> {
 	let mut cardinalities = Vec::new();
 	let mut runtimes = Vec::new();
-	measure_subplan(plan.tree.clone(), ctx, &mut cardinalities, &mut runtimes).await?;
+	measure_subplan(plan.tree.clone(), ctx, cfg, &mut cardinalities, &mut runtimes).await?;
 	Ok(MeasuredPlan {
 		plan,
 		runtime: runtimes[0],
@@ -61,15 +74,22 @@ async fn measure_plan(plan: Plan, ctx: Arc<TaskContext>) -> Result<MeasuredPlan>
 	})
 }
 
-pub async fn benchmark(sample: SampleOutput) -> Result<BenchmarkOutput> {
+pub async fn benchmark(sample: SampleOutput, cfg: BenchmarkConfig) -> Result<BenchmarkOutput> {
 	let ctx = sample.session.task_ctx();
-	let mut out = vec![measure_plan(sample.best_plan, ctx.clone()).await?];
+	let mut out = Vec::new();
+	// TODO best measurement should definitely be interleaved in to avoid
+	// warmup time affecting measurements or something like that...
 	for plan in sample.alternates {
-		out.push(measure_plan(plan, ctx.clone()).await?);
+		out.push(measure_plan(plan, ctx.clone(), &cfg).await?);
 	}
+	let best = measure_plan(sample.best_plan, ctx.clone(), &cfg).await?;
+	out.sort_by(|x, y| x.runtime.cmp(&y.runtime));
+	let chosen_idx = out.iter()
+		.position(|x| x.runtime > best.runtime).unwrap_or(out.len());
+	
 	Ok(BenchmarkOutput {
 		plans: out,
-		chosen_idx: todo!(),
-		metrics: todo!(),
+		chosen_idx,
+		metrics: OptimizerMetrics
 	})
 }

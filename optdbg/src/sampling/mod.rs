@@ -15,6 +15,10 @@ pub enum OptimizerBackend {
 	Dolomite,
 }
 
+pub struct SampleConfig {
+	pub backend: OptimizerBackend
+}
+
 impl std::str::FromStr for OptimizerBackend {
 	type Err = &'static str;
 	fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
@@ -44,12 +48,12 @@ pub struct SampleOutput {
 	pub session: SessionState,
 }
 
-pub async fn sample(query: String, opt: OptimizerBackend) -> Result<SampleOutput> {
+pub async fn sample(query: String, cfg: SampleConfig) -> Result<SampleOutput> {
 	let config = SessionConfig::default();
     let df_ctx = SessionContext::new_with_config(config);
 	let df = df_ctx.sql(&query).await?;
 	let (st, pl) = df.into_parts();
-	match opt {
+	match cfg.backend {
 		OptimizerBackend::Optd => {
 			let mut opt_ctx = OptdDFContext::new(&st);
 			let _plan = opt_ctx.df_to_optd_relational(&pl);
