@@ -7,7 +7,8 @@ mod sampling;
 mod benchmark;
 mod analysis;
 
-use sampling::{OptimizerBackend, QueryInfo, SampleConfig};
+use optdbg::sampling::SampleStrategy;
+use sampling::SampleConfig;
 use benchmark::BenchmarkConfig;
 use analysis::AnalysisConfig;
 
@@ -29,6 +30,26 @@ impl std::str::FromStr for TimeoutTime {
 	}
 }
 
+#[derive(Clone, Debug)]
+pub enum OptimizerKind {
+	Optd,
+	OptdOld,
+	Dolomite,
+}
+
+impl std::str::FromStr for OptimizerKind {
+	type Err = &'static str;
+	fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+		match s.to_lowercase().as_str() {
+			"optd" => Ok(OptimizerKind::Optd),
+			"optd-old" => Ok(OptimizerKind::OptdOld),
+			"dolomite" => Ok(OptimizerKind::Dolomite),
+			_ => Err("unknown backend")
+		}
+	}
+}
+
+
 /// Query optimizer debugger
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -39,7 +60,11 @@ struct Args {
 
 	/// Optimizer to evaluate
 	#[arg(short, long)]
-    optimizer: OptimizerBackend,
+    optimizer: OptimizerKind,
+
+	/// Sampling strategy
+	#[arg(short, long)]
+    strategy: SampleStrategy,
 
 	/// Avoid running all subplans of a plan
 	#[arg(short, long)]
@@ -50,12 +75,10 @@ struct Args {
 	timeout: Option<TimeoutTime>	
 }
 
-impl Args {
-	fn to_configs(self) -> (SampleConfig, BenchmarkConfig, AnalysisConfig) {
+impl Args {	
+	fn to_configs(self) -> (SampleConfig, BenchmarkConfig, AnalysisConfig) {				
 		(
-			SampleConfig {
-				backend: self.optimizer
-			},
+			SampleConfig,
 			BenchmarkConfig {
 				timeout: self.timeout.map(|x| x.0),
 				fast: self.fast,
@@ -70,15 +93,18 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 	let query = std::fs::read_to_string(
 		Path::new(&args.query_path)
-	).expect("read query from file");
+	).expect("read query from file");	
+		
 	let (s_cfg, b_cfg, a_cfg) = args.to_configs();
-	let query = QueryInfo {
-		query,
-		tables: todo!("figure out interface for accessing db")
-	};
-	let plans = sampling::sample(query, s_cfg).await?;
-	let bench = benchmark::benchmark(plans, b_cfg).await?;
-	let report = analysis::analyze(bench, a_cfg);
-	println!("{report}");
+	todo!("figure out how to load and set up data from cli");
+	
+	// let query = QueryInfo {
+	// 	query,
+	// 	tables: todo!("figure out interface for accessing db")
+	// };
+	// let plans = sampling::sample(query, s_cfg).await?;
+	// let bench = benchmark::benchmark(plans, b_cfg).await?;
+	// let report = analysis::analyze(bench, a_cfg);
+	// println!("{report}");
 	Ok(())
 }

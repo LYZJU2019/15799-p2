@@ -8,7 +8,7 @@ use datafusion::{
 use datafusion_execution::object_store::ObjectStoreUrl;
 use optdbg::{
 	analysis::AnalysisConfig, benchmark::BenchmarkConfig,
-	sampling::{OptimizerBackend, SampleConfig, QueryInfo}
+	sampling::{SampleConfig, QueryInfo}
 };
 use test_utils::tpch::tpch_schemas;
 use futures::StreamExt;
@@ -28,9 +28,7 @@ where
 	l_shipdate <= date '1998-12-01';
 ";
 
-	let s_cfg = SampleConfig {
-		backend: OptimizerBackend::OptdOld,		
-	};
+	let s_cfg = SampleConfig;
 
 	let b_cfg = BenchmarkConfig {
 		timeout: None,
@@ -70,9 +68,19 @@ where
 		));
 	}	
 
+	let config = SessionConfig::default();
+	let df_ctx = SessionContext::new_with_config(config);
+	for (name, table) in &tables {
+		df_ctx.register_table(name, table.clone())?;
+	}
+	let df = df_ctx.sql(tpch_query_9).await?;
+	let (state, plan) = df.into_parts();
+	
 	let query = QueryInfo {
-		query: tpch_query_9.to_string(),
+		plan: unsafe { std::mem::transmute(plan) },
+		state: unsafe { std::mem::transmute(state) },
 		tables: unsafe { std::mem::transmute(tables) },
+		backend: todo!(),
 	};
 	
 	optdbg::report_query(query, s_cfg, b_cfg, a_cfg).await?;

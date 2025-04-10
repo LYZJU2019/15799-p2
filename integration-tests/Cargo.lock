@@ -3235,6 +3235,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-recursion",
+ "async-trait",
  "chrono",
  "clap",
  "datafusion 45.0.0",
