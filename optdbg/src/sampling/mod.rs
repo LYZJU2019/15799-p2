@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::execution::SessionState;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::execution::context::{SessionConfig, SessionContext};
@@ -7,6 +8,7 @@ use dolomite::optimizer::Optimizer;
 use datafusion_dolomite_integration::conversion as dolomite_conversion;
 use anyhow::Result;
 use optd_og_datafusion_bridge::OptdPlanContext;
+use optd_og_datafusion_bridge::OptdDfContext;
 
 #[derive(Clone, Debug)]
 pub enum OptimizerBackend {
@@ -62,8 +64,28 @@ pub async fn sample(query: String, cfg: SampleConfig) -> Result<SampleOutput> {
 		},
 		OptimizerBackend::OptdOld => {
 			let mut opt_ctx = OptdPlanContext::new(&st);
-			let _plan = opt_ctx.conv_into_optd_og(&pl);			
-			todo!()
+			let plan = opt_ctx.conv_into_optd_og(&pl)?;
+			let rt_config = RuntimeEnvBuilder::new();
+			let session_config = SessionConfig::from_env()?.with_information_schema(true);
+			let df_ctx = optd_og_datafusion_bridge::create_df_context(
+				Some(session_config.clone()),
+				Some(rt_config.clone()),
+				None,
+				false,
+				false,
+				true,
+				None,
+			).await?;
+			let mut opt = df_ctx.optimizer.optimizer.lock().unwrap().take().unwrap();
+			let plan = opt.heuristic_optimize(plan);
+			let (_gid, plan, meta) = opt.cascades_optimize(plan)?;
+			opt_ctx.optimizer = Some(&opt);
+			let phys_plan = opt_ctx.conv_from_optd_og(plan, meta).await?;
+			Ok(SampleOutput {
+				best_plan: Plan::new(phys_plan, 0.0),
+				alternates: Vec::new(),
+				session: st,
+			})
 		}
 		OptimizerBackend::Dolomite => {
 			let plan = dolomite_conversion::from_df_logical(&pl)?;
