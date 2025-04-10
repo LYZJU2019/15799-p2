@@ -8,7 +8,8 @@ use dolomite::optimizer::Optimizer;
 use datafusion_dolomite_integration::conversion as dolomite_conversion;
 use anyhow::Result;
 use optd_og_datafusion_bridge::OptdPlanContext;
-use optd_og_datafusion_bridge::OptdDfContext;
+use optd_og_core::cascades::Memo;
+use optd_og_datafusion_repr::cost::COMPUTE_COST;
 
 #[derive(Clone, Debug)]
 pub enum OptimizerBackend {
@@ -62,7 +63,7 @@ pub async fn sample(query: String, cfg: SampleConfig) -> Result<SampleOutput> {
 			let _plan = opt_ctx.df_to_optd_relational(&pl);
 			todo!("There isn't really a way to run new optd yet.")
 		},
-		OptimizerBackend::OptdOld => {
+		OptimizerBackend::OptdOld => {			
 			let mut opt_ctx = OptdPlanContext::new(&st);
 			let plan = opt_ctx.conv_into_optd_og(&pl)?;
 			let rt_config = RuntimeEnvBuilder::new();
@@ -78,23 +79,31 @@ pub async fn sample(query: String, cfg: SampleConfig) -> Result<SampleOutput> {
 			).await?;
 			let mut opt = df_ctx.optimizer.optimizer.lock().unwrap().take().unwrap();
 			let plan = opt.heuristic_optimize(plan);
-			let (_gid, plan, meta) = opt.cascades_optimize(plan)?;
+			let (gid, plan, meta) = opt.cascades_optimize(plan)?;
 			opt_ctx.optimizer = Some(&opt);
 			let phys_plan = opt_ctx.conv_from_optd_og(plan, meta).await?;
+			
+			let winfo = opt.cascades_optimizer.memo.get_group_winner(gid)
+				.as_full_winner().unwrap();
+			let cost = winfo.total_cost.0[COMPUTE_COST];
+			
 			Ok(SampleOutput {
-				best_plan: Plan::new(phys_plan, 0.0),
+				best_plan: Plan::new(phys_plan, cost),
 				alternates: Vec::new(),
 				session: st,
 			})
 		}
 		OptimizerBackend::Dolomite => {
 			let plan = dolomite_conversion::from_df_logical(&pl)?;
-			let opt = dolomite::cascades::CascadesOptimizer::default(plan);
+			let mut opt = dolomite::cascades::CascadesOptimizer::default(plan);
 			let best_plan = opt.find_best_plan()?;
 			let out_plan = dolomite_conversion::to_df_logical(&best_plan)?;
 			let phys_plan = st.create_physical_plan(&out_plan).await?;
+			let cost = opt.memo.groups.get(&opt.memo.root_group_id)
+				.unwrap().winner(&opt.required_prop)
+				.unwrap().lowest_cost.0;
 			Ok(SampleOutput {
-				best_plan: Plan::new(phys_plan, 0.0),
+				best_plan: Plan::new(phys_plan, cost),
 				alternates: Vec::new(),
 				session: st,
 			})
