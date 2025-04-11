@@ -7,6 +7,7 @@ use datafusion::{
 	execution::context::{SessionConfig, SessionContext}, physical_plan::metrics::ExecutionPlanMetricsSet
 };
 use datafusion_execution::object_store::ObjectStoreUrl;
+use optdbg::sampling::{OptdOldBackend, SampleStrategy};
 use optdbg::{
 	analysis::AnalysisConfig, benchmark::BenchmarkConfig,
 	sampling::{SampleConfig, QueryInfo}
@@ -14,7 +15,6 @@ use optdbg::{
 use test_utils::tpch::tpch_schemas;
 use futures::StreamExt;
 use object_store::{ObjectStore, local::LocalFileSystem};
-
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -76,12 +76,15 @@ where
 	}
 	let df = df_ctx.sql(tpch_query_9).await?;
 	let (state, plan) = df.into_parts();
-	
+
 	let query = QueryInfo {
 		plan: unsafe { std::mem::transmute(plan) },
+		backend: Arc::new(OptdOldBackend::new(
+			unsafe { std::mem::transmute(&state) },
+			unsafe { std::mem::transmute(&tables) },
+			SampleStrategy::RuleBased).await?),
 		state: unsafe { std::mem::transmute(state) },
 		tables: unsafe { std::mem::transmute(tables) },
-		backend: todo!(),
 	};
 	
 	optdbg::report_query(query, s_cfg, b_cfg, a_cfg).await?;

@@ -88,7 +88,7 @@ pub struct OptdOldBackend<'a> {
 impl<'a> OptdOldBackend<'a> {
 	pub async fn new(
 		st: &'a SessionState,
-		tables: Vec<(String, Arc<MemTable>)>,
+		tables: &Vec<(String, Arc<MemTable>)>,
 		strat: SampleStrategy
 	) -> Result<Self> {
 		let opt_ctx = OptdPlanContext::new(&st);
@@ -98,7 +98,7 @@ impl<'a> OptdOldBackend<'a> {
 			.with_create_default_catalog_and_schema(false);
 		let schem_prov = MemorySchemaProvider::new();
 		for (name, table) in tables {
-			schem_prov.register_table(name, table.clone())?;
+			schem_prov.register_table(name.to_string(), table.clone())?;
 		}
 		let mem_prov = MemoryCatalogProvider::new();
 		mem_prov.register_schema("public", Arc::new(schem_prov))?;
