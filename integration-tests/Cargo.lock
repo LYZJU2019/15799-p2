@@ -2754,6 +2754,7 @@ dependencies = [
  "datafusion",
  "datafusion-dolomite-integration",
  "dolomite",
+ "itertools 0.14.0",
  "optd-core",
  "optd-datafusion",
  "optd_og-core",

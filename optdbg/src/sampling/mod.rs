@@ -1,23 +1,39 @@
-use std::mem::MaybeUninit;
 use std::sync::Arc;
 
-use datafusion::arrow::datatypes::Schema;
 use datafusion::catalog::{CatalogProvider, CatalogProviderList, MemoryCatalogProvider, MemoryCatalogProviderList, MemorySchemaProvider, SchemaProvider};
 use datafusion::datasource::MemTable;
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::execution::SessionState;
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::physical_plan::ExecutionPlan;
-use datafusion::execution::context::{SessionConfig, SessionContext};
+use datafusion::execution::context::SessionConfig;
 use dolomite::cascades::CascadesOptimizer;
 use dolomite::optimizer::Optimizer;
 use datafusion_dolomite_integration::conversion as dolomite_conversion;
 use anyhow::Result;
-use optd_datafusion::df_conversion::context::OptdDFContext;
+use itertools::Itertools;
 use optd_og_datafusion_bridge::{OptdDfContext, OptdPlanContext};
 use optd_og_core::cascades::Memo;
 use optd_og_datafusion_repr::cost::COMPUTE_COST;
 use async_trait::async_trait;
+
+// TODO find a way to compare plan properties?
+fn eq_plans(a: Arc<dyn ExecutionPlan>, b: Arc<dyn ExecutionPlan>) -> bool {
+	if a.name() != b.name() {
+		return false;
+	}
+	let a_childs = a.children();
+	let b_childs = b.children();
+	if a_childs.len() != b_childs.len() {
+		return false;
+	}
+	for (i,j) in a_childs.into_iter().zip(b_childs.into_iter()) {
+		if !eq_plans(i.clone(), j.clone()) {
+			return false;
+		}
+	}
+	return true;
+}
 
 pub struct Plan {
 	pub tree: Arc<dyn ExecutionPlan>,
@@ -29,6 +45,14 @@ impl Plan {
 		Self { tree, est_cost } 
 	}
 }
+
+impl std::cmp::PartialEq for Plan {
+	fn eq(&self, other: &Self) -> bool {
+		eq_plans(self.tree.clone(), other.tree.clone()) && self.est_cost == other.est_cost
+	}
+}
+
+impl std::cmp::Eq for Plan {}
 
 #[derive(Clone, Debug)]
 pub enum SampleStrategy {
@@ -120,6 +144,39 @@ impl OptdOldBackend {
 	}
 }
 
+
+impl OptdOldBackend {
+	async fn get_alts_rule(&mut self, st: &SessionState) -> Result<Vec<Plan>> {
+		let mut opt = self.df_ctx.optimizer.optimizer.lock().unwrap().take().unwrap();
+		let mut opt_ctx = OptdPlanContext::new(st);
+		let pl = self.plan.clone().unwrap();
+		let plan = opt_ctx.conv_into_optd_og(&pl)?;
+		let plan = opt.heuristic_optimize(plan);
+		let rules = opt.cascades_optimizer.rules();
+		let mut out = Vec::new();
+		for rs in rules.into_iter().powerset() {
+			// Avoid borrowing issue. Kinda hacky.
+			let mut opt_ctx = OptdPlanContext::new(st);
+			opt.cascades_optimizer.rules = Arc::from(
+				rs.into_iter().cloned().collect::<Vec<_>>().into_boxed_slice()
+			);
+			opt.cascades_optimizer.step_clear();
+			let (gid, plan, meta) = opt.cascades_optimize(plan.clone())?;
+			let winfo = opt.cascades_optimizer.memo.get_group_winner(gid)
+				.as_full_winner().unwrap().clone();
+			opt_ctx.optimizer = Some(&opt);
+			let phys_plan = opt_ctx.conv_from_optd_og(plan, meta).await?;
+			let cost = winfo.total_cost.0[COMPUTE_COST];
+
+			let phys_plan = Plan::new(phys_plan, cost);
+			if !out.contains(&phys_plan) {
+				out.push(phys_plan);
+			}
+		}
+		Ok(out)
+	}
+}
+
 #[async_trait]
 impl Sampler for OptdOldBackend {
 	async fn get_best(&mut self, st: &SessionState, pl: LogicalPlan) -> Result<Plan> {
@@ -132,16 +189,16 @@ impl Sampler for OptdOldBackend {
 			.as_full_winner().unwrap().clone();
 		opt_ctx.optimizer = Some(&opt);
 		let phys_plan = opt_ctx.conv_from_optd_og(plan, meta).await?;
-		self.plan = Some(pl);
-		
 		let cost = winfo.total_cost.0[COMPUTE_COST];
+		self.plan = Some(pl);
 		Ok(Plan::new(phys_plan, cost))
 	}
 
 	// TODO 
 	async fn get_alternates(&mut self, st: &SessionState) -> Result<Vec<Plan>> {
 		match self.strat {
-			_ => todo!(),
+			SampleStrategy::RuleBased => self.get_alts_rule(st).await,
+			_ => todo!()
 		}
 	}
 }

@@ -12,7 +12,7 @@ pub async fn report_query(
 	a_cfg: analysis::AnalysisConfig
 ) -> Result<analysis::Report> {
 	let plans = sampling::sample(query, s_cfg).await?;
-	println!("Done sampling");
+	println!("Done sampling. Found {} alternates.", plans.alternates.len());
 	let bench = benchmark::benchmark(plans, b_cfg).await?;
 	Ok(analysis::analyze(bench, a_cfg))
 }

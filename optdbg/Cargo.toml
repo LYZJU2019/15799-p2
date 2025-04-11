@@ -18,5 +18,6 @@ dolomite = { path = "./datafusion-dolomite/dolomite" }
 datafusion-dolomite-integration = { path = "./datafusion-dolomite/datafusion-dolomite-integration/" }
 async-recursion = "1.1.1"
 async-trait = "0.1.88"
+itertools = "0.14.0"
 
 
