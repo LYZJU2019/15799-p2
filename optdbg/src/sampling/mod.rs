@@ -129,12 +129,12 @@ impl<'a> Sampler for OptdOldBackend<'a> {
 		let plan = self.opt_ctx.conv_into_optd_og(&pl)?;
 		let plan = opt.heuristic_optimize(plan);
 		let (gid, plan, meta) = opt.cascades_optimize(plan)?;
+		let winfo = opt.cascades_optimizer.memo.get_group_winner(gid)
+			.as_full_winner().unwrap().clone();
 		// FIXME(quantumish) this is questionable :(
-		// self.opt_ctx.optimizer = Some(&opt);
+		self.opt_ctx.optimizer = Some(Box::leak(opt));
 		let phys_plan = self.opt_ctx.conv_from_optd_og(plan, meta).await?;
 		
-		let winfo = opt.cascades_optimizer.memo.get_group_winner(gid)
-			.as_full_winner().unwrap();
 		let cost = winfo.total_cost.0[COMPUTE_COST];
 		Ok(Plan::new(phys_plan, cost))
 	}

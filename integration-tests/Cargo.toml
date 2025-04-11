@@ -12,11 +12,11 @@ name = "runner"
 path = "src/runner.rs"
 
 [dependencies]
-datafusion-common = { path = "./datafusion/datafusion/common" }
-datafusion-expr = { path = "./datafusion/datafusion/expr" }
-datafusion-execution = { path = "./datafusion/datafusion/execution" }
-datafusion-catalog = { path = "./datafusion/datafusion/catalog" }
-datafusion = { path = "./datafusion/datafusion/core" }
+datafusion-common = "46.0.1" # { path = "./datafusion/datafusion/common" }
+datafusion-expr = "46.0.1" # { path = "./datafusion/datafusion/expr" }
+datafusion-execution = "46.0.1" #{ path = "./datafusion/datafusion/execution" }
+datafusion-catalog = "46.0.1" # { path = "./datafusion/datafusion/catalog" }
+datafusion = "46.0.1" # { path = "./datafusion/datafusion/core" }
 test-utils = { path = "./datafusion/test-utils" }
 tokio = { version = "1.44.2", features = ["full"] }
 optdbg = { path = "../optdbg" }

@@ -65,7 +65,7 @@ where
 		}
 		tables.push((
 			tableref.name,
-			Arc::new(MemTable::try_new(schemaref.clone(), vec![result])?)
+			Arc::new(MemTable::try_new(schemaref.clone(), vec![vec![]])?)
 		));
 	}	
 
@@ -77,14 +77,14 @@ where
 	let df = df_ctx.sql(tpch_query_9).await?;
 	let (state, plan) = df.into_parts();
 
+	let st = Box::leak(Box::new(state.clone()));
 	let query = QueryInfo {
-		plan: unsafe { std::mem::transmute(plan) },
+		plan,
 		backend: Arc::new(OptdOldBackend::new(
-			unsafe { std::mem::transmute(&state) },
-			unsafe { std::mem::transmute(&tables) },
-			SampleStrategy::RuleBased).await?),
-		state: unsafe { std::mem::transmute(state) },
-		tables: unsafe { std::mem::transmute(tables) },
+			st, &tables, SampleStrategy::RuleBased
+		).await?),
+		state,
+		tables,
 	};
 	
 	optdbg::report_query(query, s_cfg, b_cfg, a_cfg).await?;
