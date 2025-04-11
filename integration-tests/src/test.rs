@@ -77,11 +77,10 @@ where
 	let df = df_ctx.sql(tpch_query_9).await?;
 	let (state, plan) = df.into_parts();
 
-	let st = Box::leak(Box::new(state.clone()));
 	let query = QueryInfo {
 		plan,
 		backend: Arc::new(OptdOldBackend::new(
-			st, &tables, SampleStrategy::RuleBased
+			&tables, SampleStrategy::RuleBased
 		).await?),
 		state,
 		tables,

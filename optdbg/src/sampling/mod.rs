@@ -51,47 +51,45 @@ impl std::str::FromStr for SampleStrategy {
 
 #[async_trait]
 pub trait Sampler {
-	async fn get_best(&mut self, pl: LogicalPlan) -> Result<Plan>;
+	async fn get_best(&mut self, st: &SessionState, pl: LogicalPlan) -> Result<Plan>;
 
 	/// Must be called after Sampler::get_best().
-	async fn get_alternates(&mut self) -> Result<Vec<Plan>>;
+	async fn get_alternates(&mut self, st: &SessionState) -> Result<Vec<Plan>>;
 }
 
 pub struct OptdBackend {
-	ctx: OptdDFContext,
+	plan: Option<LogicalPlan>,
 	strat: SampleStrategy
 }
 
 impl OptdBackend {
-	pub fn new<'a>(st: &'a SessionState, strat: SampleStrategy) -> Self {
-		Self { ctx: OptdDFContext::new(st), strat } 
+	pub fn new(strat: SampleStrategy) -> Self {
+		Self { strat, plan: None } 
 	}
 }
 
 #[async_trait]
 impl Sampler for OptdBackend {
-	async fn get_best(&mut self, _pl: LogicalPlan) -> Result<Plan> {
+	async fn get_best(&mut self, st: &SessionState, _pl: LogicalPlan) -> Result<Plan> {
 		todo!("new optd isn't runnable yet")
 	}
 
-	async fn get_alternates(&mut self) -> Result<Vec<Plan>> {
+	async fn get_alternates(&mut self, st: &SessionState) -> Result<Vec<Plan>> {
 		todo!("new optd isn't runnable yet")
 	}
 }
 
-pub struct OptdOldBackend<'a> {
-	opt_ctx: OptdPlanContext<'a>,
+pub struct OptdOldBackend {
 	df_ctx: OptdDfContext,
-	strat: SampleStrategy
+	strat: SampleStrategy,
+	plan: Option<LogicalPlan>,
 }
 
-impl<'a> OptdOldBackend<'a> {
+impl OptdOldBackend {
 	pub async fn new(
-		st: &'a SessionState,
 		tables: &Vec<(String, Arc<MemTable>)>,
 		strat: SampleStrategy
-	) -> Result<Self> {
-		let opt_ctx = OptdPlanContext::new(&st);
+	) -> Result<Self> {		
 		let rt_config = RuntimeEnvBuilder::new();
 		let session_config = SessionConfig::from_env()?
 			.with_information_schema(true)
@@ -116,32 +114,35 @@ impl<'a> OptdOldBackend<'a> {
 		).await?;
 		Ok(Self {
 			df_ctx,
-			opt_ctx,
-			strat
+			strat,
+			plan: None
 		})
 	}
 }
 
 #[async_trait]
-impl<'a> Sampler for OptdOldBackend<'a> {
-	async fn get_best(&mut self, pl: LogicalPlan) -> Result<Plan> {
+impl Sampler for OptdOldBackend {
+	async fn get_best(&mut self, st: &SessionState, pl: LogicalPlan) -> Result<Plan> {
 		let mut opt = self.df_ctx.optimizer.optimizer.lock().unwrap().take().unwrap();
-		let plan = self.opt_ctx.conv_into_optd_og(&pl)?;
+		let mut opt_ctx = OptdPlanContext::new(st);
+		let plan = opt_ctx.conv_into_optd_og(&pl)?;
 		let plan = opt.heuristic_optimize(plan);
 		let (gid, plan, meta) = opt.cascades_optimize(plan)?;
 		let winfo = opt.cascades_optimizer.memo.get_group_winner(gid)
 			.as_full_winner().unwrap().clone();
-		// FIXME(quantumish) this is questionable :(
-		self.opt_ctx.optimizer = Some(Box::leak(opt));
-		let phys_plan = self.opt_ctx.conv_from_optd_og(plan, meta).await?;
+		opt_ctx.optimizer = Some(&opt);
+		let phys_plan = opt_ctx.conv_from_optd_og(plan, meta).await?;
+		self.plan = Some(pl);
 		
 		let cost = winfo.total_cost.0[COMPUTE_COST];
 		Ok(Plan::new(phys_plan, cost))
 	}
 
 	// TODO 
-	async fn get_alternates(&mut self) -> Result<Vec<Plan>> {
-		Ok(vec![])
+	async fn get_alternates(&mut self, st: &SessionState) -> Result<Vec<Plan>> {
+		match self.strat {
+			_ => todo!(),
+		}
 	}
 }
 
@@ -159,7 +160,7 @@ impl DolomiteBackend {
 
 #[async_trait]
 impl Sampler for DolomiteBackend {
-	async fn get_best(&mut self, pl: LogicalPlan) -> Result<Plan> {
+	async fn get_best(&mut self, st: &SessionState , pl: LogicalPlan) -> Result<Plan> {
 		let plan = dolomite_conversion::from_df_logical(&pl)?;
 		let mut opt = dolomite::cascades::CascadesOptimizer::default(plan);
 		opt.rules.extend(vec![
@@ -181,7 +182,7 @@ impl Sampler for DolomiteBackend {
 	}
 
 	// TODO 
-	async fn get_alternates(&mut self) -> Result<Vec<Plan>> {
+	async fn get_alternates(&mut self, st: &SessionState) -> Result<Vec<Plan>> {
 		Ok(vec![])
 	}
 }
@@ -204,8 +205,8 @@ pub struct QueryInfo {
 pub async fn sample(mut query: QueryInfo, _cfg: SampleConfig) -> Result<SampleOutput> {
 	let backend = Arc::get_mut(&mut query.backend).unwrap();
 	Ok(SampleOutput {
-		best_plan: backend.get_best(query.plan).await?,
-		alternates: backend.get_alternates().await?,
+		best_plan: backend.get_best(&query.state, query.plan).await?,
+		alternates: backend.get_alternates(&query.state).await?,
 		session: query.state,
 	})
 }		
