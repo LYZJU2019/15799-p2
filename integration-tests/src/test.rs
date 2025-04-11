@@ -1,8 +1,9 @@
 use std::sync::Arc;
 
+use datafusion::datasource::physical_plan::FileScanConfig;
 use datafusion::datasource::MemTable;
 use datafusion::{
-	datasource::{listing::PartitionedFile, physical_plan::{CsvSource, FileScanConfigBuilder, FileSource, FileStream}},
+	datasource::{listing::PartitionedFile, physical_plan::{CsvSource, FileSource, FileStream}},
 	execution::context::{SessionConfig, SessionContext}, physical_plan::metrics::ExecutionPlanMetricsSet
 };
 use datafusion_execution::object_store::ObjectStoreUrl;
@@ -44,13 +45,13 @@ where
 		println!("reading {}", tableref.name);
 		let path = format!("./tpch-data/{}.tbl", tableref.name);
 		let path = std::path::Path::new(&path).canonicalize()?;
-		let scan_config = FileScanConfigBuilder::new(
+		let scan_config = FileScanConfig::new(
 			ObjectStoreUrl::local_filesystem(),
 			schemaref.clone(),
 			Arc::new(CsvSource::default())
 		).with_file(PartitionedFile::new(
 			path.display().to_string(), 10
-		)).build();
+		));
 		let config = CsvSource::new(true, b'|', b'"')
 			.with_batch_size(8192)
 			.with_schema(schemaref.clone());

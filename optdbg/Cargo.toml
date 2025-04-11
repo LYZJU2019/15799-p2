@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0.97"
 clap = { version = "4.5.35", features = ["derive"] }
-datafusion = "45"
+datafusion = "46.0.1"
 optd-core = { path = "./optd/optd-core" }
 chrono = "0.4.39"
 optd-datafusion = { path = "./optd/optd-datafusion" }
