@@ -18,15 +18,38 @@ use object_store::{ObjectStore, local::LocalFileSystem};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-	env_logger::init();
+	// tracing_subscriber::fmt()
+	// 	.with_max_level(tracing::Level::DEBUG)
+	// 	.init();
+	
 	let tpch_query_9 = "
 select
-	l_returnflag,
-	l_linestatus
+	nation,
+	sum(amount) as sum_profit
 from
-	lineitem
-where
-	l_shipdate <= date '1998-12-01';
+	(
+		select
+			n_name as nation,
+			l_extendedprice * (1 - l_discount) - ps_supplycost * l_quantity as amount
+		from
+			part,
+			supplier,
+			lineitem,
+			partsupp,
+			orders,
+			nation
+		where
+			s_suppkey = l_suppkey
+			and ps_suppkey = l_suppkey
+			and ps_partkey = l_partkey
+			and p_partkey = l_partkey
+			and o_orderkey = l_orderkey
+			and s_nationkey = n_nationkey
+			and p_name like '%:1%'
+	) as profit
+group by
+	nation
+LIMIT 1;
 ";
 
 	let s_cfg = SampleConfig;
@@ -41,28 +64,28 @@ where
 	let mut tables = Vec::new();
 	for tableref in tpch_schemas() {
 		let schemaref = Arc::new(tableref.schema);
-		let object_store = Arc::new(LocalFileSystem::new());
-		println!("reading {}", tableref.name);
-		let path = format!("./tpch-data/{}.tbl", tableref.name);
-		let path = std::path::Path::new(&path).canonicalize()?;
-		let scan_config = FileScanConfig::new(
-			ObjectStoreUrl::local_filesystem(),
-			schemaref.clone(),
-			Arc::new(CsvSource::default())
-		).with_file(PartitionedFile::new(
-			path.display().to_string(), 10
-		));
-		let config = CsvSource::new(true, b'|', b'"')
-			.with_batch_size(8192)
-			.with_schema(schemaref.clone());
-		let opener = config
-			.create_file_opener(object_store, &scan_config, 0);
-		let mut result = vec![];
-		let mut stream =
-			FileStream::new(&scan_config, 0, opener, &ExecutionPlanMetricsSet::new())?;
-		while let Some(batch) = stream.next().await.transpose()? {
-			result.push(batch);
-		}
+		// let object_store = Arc::new(LocalFileSystem::new());
+		// println!("reading {}", tableref.name);
+		// let path = format!("./tpch-data/{}.tbl", tableref.name);
+		// let path = std::path::Path::new(&path).canonicalize()?;
+		// let scan_config = FileScanConfig::new(
+		// 	ObjectStoreUrl::local_filesystem(),
+		// 	schemaref.clone(),
+		// 	Arc::new(CsvSource::default())
+		// ).with_file(PartitionedFile::new(
+		// 	path.display().to_string(), 10
+		// ));
+		// let config = CsvSource::new(true, b'|', b'"')
+		// 	.with_batch_size(8192)
+		// 	.with_schema(schemaref.clone());
+		// let opener = config
+		// 	.create_file_opener(object_store, &scan_config, 0);
+		// let mut result = vec![];
+		// let mut stream =
+		// 	FileStream::new(&scan_config, 0, opener, &ExecutionPlanMetricsSet::new())?;
+		// while let Some(batch) = stream.next().await.transpose()? {
+		// 	result.push(batch);
+		// }
 		tables.push((
 			tableref.name,
 			Arc::new(MemTable::try_new(schemaref.clone(), vec![vec![]])?)

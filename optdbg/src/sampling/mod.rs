@@ -16,6 +16,8 @@ use optd_og_datafusion_bridge::{OptdDfContext, OptdPlanContext};
 use optd_og_core::cascades::Memo;
 use optd_og_datafusion_repr::cost::COMPUTE_COST;
 use async_trait::async_trait;
+use optd_og_datafusion_repr::rules::PhysicalConversionRule;
+use optd_og_datafusion_repr::DatafusionOptimizer;
 
 // TODO find a way to compare plan properties?
 fn eq_plans(a: Arc<dyn ExecutionPlan>, b: Arc<dyn ExecutionPlan>) -> bool {
@@ -35,6 +37,22 @@ fn eq_plans(a: Arc<dyn ExecutionPlan>, b: Arc<dyn ExecutionPlan>) -> bool {
 	return true;
 }
 
+fn format_plan(
+	f: &mut std::fmt::Formatter<'_>,
+	plan: Arc<dyn ExecutionPlan>,
+	indent_level: usize
+) -> std::fmt::Result {
+	for _ in 0..indent_level {
+		write!(f, "  ")?;
+	}
+	writeln!(f, "{}", plan.name())?;
+	for child in plan.children() {
+		format_plan(f, child.clone(), indent_level + 1)?;
+	}
+	Ok(())
+}
+
+
 pub struct Plan {
 	pub tree: Arc<dyn ExecutionPlan>,
 	pub est_cost: f64,
@@ -53,6 +71,12 @@ impl std::cmp::PartialEq for Plan {
 }
 
 impl std::cmp::Eq for Plan {}
+
+impl std::fmt::Display for Plan {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		format_plan(f, self.tree.clone(), 0)
+	}
+}
 
 #[derive(Clone, Debug)]
 pub enum SampleStrategy {
@@ -107,6 +131,7 @@ pub struct OptdOldBackend {
 	df_ctx: OptdDfContext,
 	strat: SampleStrategy,
 	plan: Option<LogicalPlan>,
+	opt: Option<DatafusionOptimizer>
 }
 
 impl OptdOldBackend {
@@ -139,38 +164,53 @@ impl OptdOldBackend {
 		Ok(Self {
 			df_ctx,
 			strat,
-			plan: None
+			plan: None,
+			opt: None
 		})
 	}
-}
 
-
-impl OptdOldBackend {
 	async fn get_alts_rule(&mut self, st: &SessionState) -> Result<Vec<Plan>> {
-		let mut opt = self.df_ctx.optimizer.optimizer.lock().unwrap().take().unwrap();
-		let mut opt_ctx = OptdPlanContext::new(st);
+		let opt = self.opt.as_mut().unwrap();
 		let pl = self.plan.clone().unwrap();
-		let plan = opt_ctx.conv_into_optd_og(&pl)?;
-		let plan = opt.heuristic_optimize(plan);
 		let rules = opt.cascades_optimizer.rules();
 		let mut out = Vec::new();
-		for rs in rules.into_iter().powerset() {
-			// Avoid borrowing issue. Kinda hacky.
+
+		// Pretty hacky to do powerset with the physical rules included (since we need all).
+		// Cloning out of rules seems to make this not usable within an async_trait
+		// so we just drain and re-add. Shouldn't be horrifically slow but is wasteful.
+		for mut rs in rules.iter().powerset() {
+			rs.retain(|x| x.name() != "physical_conversion");
+			let temp = PhysicalConversionRule::all_conversions();
+			rs.extend(temp.iter());
+			
+			if rs.iter().find(|r| r.name() == "join_commute_rule").is_none() ||
+			   rs.iter().find(|r| r.name() == "join_assoc_rule").is_none() ||
+			   rs.iter().find(|r| r.name() == "project_filter_transpose_rule").is_some()
+			{
+				continue;
+			}
+			
+			// Avoid borrowing issue. Pretty hacky.
 			let mut opt_ctx = OptdPlanContext::new(st);
+			let plan = opt_ctx.conv_into_optd_og(&pl)?;
+			let plan = opt.heuristic_optimize(plan);
+		
 			opt.cascades_optimizer.rules = Arc::from(
 				rs.into_iter().cloned().collect::<Vec<_>>().into_boxed_slice()
 			);
 			opt.cascades_optimizer.step_clear();
-			let (gid, plan, meta) = opt.cascades_optimize(plan.clone())?;
+			let (gid, opt_plan, meta) = opt.cascades_optimize(plan.clone())?;
 			let winfo = opt.cascades_optimizer.memo.get_group_winner(gid)
 				.as_full_winner().unwrap().clone();
 			opt_ctx.optimizer = Some(&opt);
-			let phys_plan = opt_ctx.conv_from_optd_og(plan, meta).await?;
+			let phys_plan = opt_ctx.conv_from_optd_og(opt_plan, meta).await?;
 			let cost = winfo.total_cost.0[COMPUTE_COST];
-
 			let phys_plan = Plan::new(phys_plan, cost);
+			
 			if !out.contains(&phys_plan) {
+				println!("{}", phys_plan);
 				out.push(phys_plan);
+				println!("Have {} alternate plans", out.len());
 			}
 		}
 		Ok(out)
@@ -191,7 +231,10 @@ impl Sampler for OptdOldBackend {
 		let phys_plan = opt_ctx.conv_from_optd_og(plan, meta).await?;
 		let cost = winfo.total_cost.0[COMPUTE_COST];
 		self.plan = Some(pl);
-		Ok(Plan::new(phys_plan, cost))
+		self.opt = Some(*opt);
+		let out = Plan::new(phys_plan, cost);
+		println!("best is\n{out}");
+		Ok(out)
 	}
 
 	// TODO 
@@ -235,7 +278,9 @@ impl Sampler for DolomiteBackend {
 			.unwrap().winner(&opt.required_prop)
 			.unwrap().lowest_cost.0;
 		self.opt = Some(opt);
-		Ok(Plan::new(phys_plan, cost))
+		let out = Plan::new(phys_plan, cost);
+		println!("best is\n{out}");
+		Ok(out)
 	}
 
 	// TODO 
