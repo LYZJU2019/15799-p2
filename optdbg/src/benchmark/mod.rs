@@ -1,14 +1,17 @@
-use std::env::temp_dir;
 use std::io::Write;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::datatypes::Schema;
+use datafusion::catalog::SchemaProvider;
 use datafusion::execution::TaskContext;
 use anyhow::Result;
+use datafusion::physical_plan::{collect, ExecutionPlan};
 use datafusion_proto::bytes::physical_plan_to_bytes;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
+use async_recursion::async_recursion;
 
 use crate::sampling::SampleOutput;
 use crate::common::{Plan, PlanMeasurements};
@@ -31,7 +34,6 @@ pub struct BenchmarkOutput {
 	pub metrics: OptimizerMetrics,
 }
 
-
 /// Plan annotated with runtimes / cardinalities.
 pub struct MeasuredPlan {
 	pub plan: Plan,
@@ -42,6 +44,7 @@ pub struct MeasuredPlan {
 	/// Preorder array of each subplan's runtime.
 	// outer Option semantically means "we may not have ran this query"
 	// inner Options semantically mean "we ran query and it timed out / died"
+	// TODO distinguish OOM vs death?
 	pub sub_runtimes: Option<Vec<Option<Duration>>>,
 }
 
@@ -59,16 +62,110 @@ impl MeasuredPlan {
 	}
 }
 
+async fn time_subplan(
+	node: Arc<dyn ExecutionPlan>,
+	ctx: Arc<TaskContext>,
+	timeout: Option<Duration>,
+) -> Result<Option<(Vec<RecordBatch>, Duration)>> {
+	let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+	let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+	if let Some(timeout) = timeout {
+		let (node, ctx) = (node.clone(), ctx.clone());
+		let _ = tokio::task::spawn(async move {
+			let before = Instant::now();
+			let out = collect(node, ctx).await;
+			let after = Instant::now();
+			let _ = result_tx.send((out, after-before));
+		});
+		tokio::spawn(async move {
+			tokio::time::sleep(timeout).await;
+			let _ = cancel_tx.send(());
+		});
+		tokio::select! {
+			result = result_rx => {
+				let (res, time) = result?;
+				Ok(Some((res?, time)))
+			}
+			_ = cancel_rx => {
+				Ok(None)
+			}
+		}
+	} else {
+		let (node, ctx) = (node.clone(), ctx.clone());
+		let before = Instant::now();
+		let out = collect(node, ctx).await;
+		let after = Instant::now();
+		Ok(Some((out?, after-before)))
+	}
+}
+
+/// Recursively populate cardinality and runtime arrays.
+// TODO need to be a *lot* more rigorous for the actual benchmarking here.
+// one option is to try and integrate an existing optimizer like criterion
+// or divan. Both of these don't really support usage as a library though...
+// Doing this properly is an easy way to surpass TAQO.
+//
+// The other major TODO (this is long term) is to support the `fast` option 
+// and implement the optimization in www.vldb.org/pvldb/vol2/vldb09-294.pdf
+#[async_recursion]
+async fn measure_subplan(
+	node: Arc<dyn ExecutionPlan>,
+	ctx: Arc<TaskContext>,
+	cfg: &BenchmarkConfig,
+	cards: &mut Vec<Option<usize>>,
+	times: &mut Vec<Option<Duration>>,
+) -> Result<()> {
+	if let Some((batches, time)) = time_subplan(node.clone(), ctx.clone(), cfg.timeout).await? {
+		cards.push(Some(batches.iter().map(|x| x.num_rows()).sum()));
+		times.push(Some(time));
+	} else {
+		cards.push(None);
+		times.push(None);
+	}
+	for child in node.children() {
+		measure_subplan(child.clone(), ctx.clone(), cfg, cards, times).await?;
+	}
+	Ok(())
+}
+
 /// Measure cardinalities and runtimes of plan and subplans.
 async fn measure_plan(
 	plan: Plan,
 	ctx: Arc<TaskContext>,
 	cfg: &BenchmarkConfig,
-	tables: &Vec<(String, Schema)>
 ) -> Result<MeasuredPlan> {
-	println!("before");
+	let mut cardinalities = Vec::new();
+	let mut runtimes = Vec::new();
+	// FIXME temporary hack to get around OOMs
+	if plan.est_cost < 1000000000.0 {
+		measure_subplan(plan.tree.clone(), ctx, cfg, &mut cardinalities, &mut runtimes).await?;
+	} else {
+		cardinalities.push(None);
+		runtimes.push(None);
+	}
+	if let Some(runtime) = runtimes[0] {
+		println!("ran plan in {}ms (est cost {})", runtime.as_millis(), plan.est_cost);
+	} else {
+		println!("plan timed out (est cost {})", plan.est_cost);
+	}
+	Ok(MeasuredPlan {
+		plan,
+		runtime: runtimes[0],
+		cardinalities,
+		sub_runtimes: Some(runtimes),
+	})
+}
+
+// this version is for cross-process stuff...
+// but switching to `ListingTable`s kinda fixed OOM issues
+/// Measure cardinalities and runtimes of plan and subplans.
+async fn measure_plan_ipc(
+	plan: Plan,
+	ctx: Arc<TaskContext>,
+	cfg: &BenchmarkConfig,
+	tables: Arc<dyn SchemaProvider>,
+) -> Result<MeasuredPlan> {
 	let bytes = physical_plan_to_bytes(plan.clone().tree)?;
-	println!("after (please)");
 	let mut plan_file = tempfile::NamedTempFile::new()?;
 	plan_file.write_all(&bytes)?;
 
@@ -76,27 +173,36 @@ async fn measure_plan(
 	let mut cfg_file = tempfile::NamedTempFile::new()?;
 	cfg_file.write_all(&bytes.as_bytes())?;
 
-	let bytes = serde_json::to_string(tables)?;
+	let mut schemas = Vec::new();
+	for i in tables.table_names() {
+		schemas.push((i.clone(), tables.table(&i).await?.unwrap().schema()));
+	}
+	
+	let bytes = serde_json::to_string(&schemas)?;
 	let mut schema_file = tempfile::NamedTempFile::new()?;
 	schema_file.write_all(&bytes.as_bytes())?;
 
 	let out_file = tempfile::NamedTempFile::new()?;
-	// TODO(quantumish) need better solution than relative path lol
-	let output = std::process::Command::new("../optdbg/target/debug/runner")
+	// TODO need better solution than relative path lol
+	let output = std::process::Command::new("../optdbg/target/release/runner")
 		.arg("-p").arg(plan_file.path())
 		.arg("-c").arg(cfg_file.path())
 		.arg("-s").arg(schema_file.path())
 		.arg("-o").arg(out_file.path())
-		.output()?;
-
-	let measurements: PlanMeasurements = serde_json::from_reader(out_file)?;
+		.status()?;
 	
-	// if let Some(runtime) = runtimes[0] {
-	// 	println!("ran plan in {}ms (est cost {})", runtime.as_millis(), plan.est_cost);
-	// } else {
-	// 	println!("plan timed out (est cost {})", plan.est_cost);
-	// }
-	Ok(MeasuredPlan::new(plan, measurements))
+	if !output.success() {
+		let size = plan.size();
+		Ok(MeasuredPlan {
+			plan,
+			runtime: None,
+			cardinalities: vec![None; size],
+			sub_runtimes: Some(vec![None; size]),
+		})
+	} else {
+		let measurements: PlanMeasurements = serde_json::from_reader(out_file)?;
+		Ok(MeasuredPlan::new(plan, measurements))
+	}
 }
 
 pub async fn benchmark(sample: SampleOutput, cfg: BenchmarkConfig) -> Result<BenchmarkOutput> {
@@ -104,10 +210,10 @@ pub async fn benchmark(sample: SampleOutput, cfg: BenchmarkConfig) -> Result<Ben
 	let mut out = Vec::new();
 	// TODO best measurement should definitely be interleaved in to avoid
 	// warmup time affecting measurements or something like that...
-	let best = measure_plan(sample.best_plan, ctx.clone(), &cfg, &sample.raw_tables).await?;
+	let best = measure_plan_ipc(sample.best_plan, ctx.clone(), &cfg, sample.tables.clone()).await?;
 	for plan in sample.alternates.into_iter()
 		.sorted_by(|x, y| x.est_cost.partial_cmp(&y.est_cost).unwrap()) {
-		out.push(measure_plan(plan, ctx.clone(), &cfg, &sample.raw_tables).await?);
+		out.push(measure_plan_ipc(plan, ctx.clone(), &cfg, sample.tables.clone()).await?);
 	}
 	out.sort_by(|x, y| x.runtime.cmp(&y.runtime));
 	let chosen_idx = out.iter()

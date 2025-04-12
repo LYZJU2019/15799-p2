@@ -1,23 +1,17 @@
 use std::sync::Arc;
 
 use datafusion::datasource::listing::{ListingTable, ListingTableConfig, ListingTableUrl};
-use datafusion::datasource::physical_plan::FileScanConfig;
-use datafusion::datasource::MemTable;
+use datafusion::execution::options::ReadOptions;
 use datafusion::prelude::CsvReadOptions;
-use datafusion::{
-	datasource::{listing::PartitionedFile, physical_plan::{CsvSource, FileSource, FileStream}},
-	execution::context::{SessionConfig, SessionContext}, physical_plan::metrics::ExecutionPlanMetricsSet
-};
+use datafusion::execution::context::{SessionConfig, SessionContext};
+use datafusion_catalog::{MemorySchemaProvider, SchemaProvider, TableProvider};
 use datafusion_common::TableReference;
-use datafusion_execution::object_store::ObjectStoreUrl;
 use optdbg::sampling::{OptdOldBackend, SampleStrategy, RuleBailStrategy};
 use optdbg::{
 	analysis::AnalysisConfig, benchmark::BenchmarkConfig,
 	sampling::{SampleConfig, QueryInfo}
 };
 use test_utils::tpch::tpch_schemas;
-use futures::StreamExt;
-use object_store::{ObjectStore, local::LocalFileSystem};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -58,77 +52,36 @@ LIMIT 1;
 	let s_cfg = SampleConfig;
 
 	let b_cfg = BenchmarkConfig {
-		timeout: Some(std::time::Duration::from_millis(50)),
+		timeout: Some(std::time::Duration::from_secs(1)),
 		fast: false,
 	};
 
 	let a_cfg = AnalysisConfig;
 
-	let mut tables = Vec::new();
 	let config = SessionConfig::default();
 	let df_ctx = SessionContext::new_with_config(config);
-	for tableref in tpch_schemas() {
-		let schemaref = Arc::new(tableref.schema);
-		let object_store = Arc::new(LocalFileSystem::new());
-		println!("loading {}", tableref.name);
-		let path = format!("./tpch-data/{}.tbl", tableref.name);
-		let path = std::path::Path::new(&path).canonicalize()?;
-		let scan_config = FileScanConfig::new(
-			ObjectStoreUrl::local_filesystem(),
-			schemaref.clone(),
-			Arc::new(CsvSource::default())
-		).with_file(PartitionedFile::new(
-			path.display().to_string(), 10
-		));
-		let config = CsvSource::new(true, b'|', b'"')
-			.with_batch_size(8192)
-			.with_schema(schemaref.clone());
-		let opener = config
-			.create_file_opener(object_store, &scan_config, 0);
-		let mut result = vec![];
-		let mut stream =
-			FileStream::new(&scan_config, 0, opener, &ExecutionPlanMetricsSet::new())?;
-		while let Some(batch) = stream.next().await.transpose()? {
-			result.push(batch);
-		}
-		
-		// let options = CsvReadOptions::new().delimiter("|").quote('"');
-		// let listing_options = options
-        //     .to_listing_options(&self.copied_config(), self.copied_table_options());
-
-		// let table_ref = TableReference::partial(tablschema, tableref.name);
-		
-		// df_ctx.register_table(name, table.clone())?;
-		// let table_path = ListingTableUrl::parse(table_path)?;
-        
-        // let config = ListingTableConfig::new(table_path)
-        //     .with_listing_options(options)
-        //     .with_schema(schemaref);
-
-        // let table = ListingTable::try_new(config)?.with_definition(sql_definition);
-        // self.register_table(table_ref, Arc::new(table))?;
-		
-		tables.push((
-			tableref.name,
-			Arc::new(MemTable::try_new(schemaref.clone(), vec![result])?)
-		));
+	let schemas = tpch_schemas();
+	for tableref in &schemas {
+		let options = CsvReadOptions::new().delimiter(b'|').quote(b'"')
+			.schema(&tableref.schema);
+		let path = format!("./tpch-data/{}.csv", tableref.name);
+		let table_path = std::path::Path::new(&path).canonicalize()?;
+		df_ctx.register_csv(tableref.name.clone(), table_path.to_str().unwrap(), options).await?;
 	}	
 
-	for (name, table) in &tables {
-		df_ctx.register_table(name, table.clone())?;
-	}
 	let df = df_ctx.sql(tpch_query_9).await?;
 	
 	let (state, plan) = df.into_parts();
 
+	let tables = df_ctx.state().schema_for_ref("part")?;	
 	let query = QueryInfo {
 		plan,
 		backend: Arc::new(OptdOldBackend::new(
-			&tables, SampleStrategy::RuleBased(RuleBailStrategy::Threshold(8))
+			tables.clone(),
+			SampleStrategy::RuleBased(RuleBailStrategy::Threshold(8))
 		).await?),
 		state,
 		tables,
-		raw_tables: tpch_schemas().into_iter().map(|x| (x.name, x.schema)).collect(),
 	};
 	
 	optdbg::report_query(query, s_cfg, b_cfg, a_cfg).await?;

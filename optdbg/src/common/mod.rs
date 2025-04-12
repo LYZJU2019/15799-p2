@@ -22,6 +22,10 @@ fn eq_plans(a: Arc<dyn ExecutionPlan>, b: Arc<dyn ExecutionPlan>) -> bool {
 	return true;
 }
 
+fn plan_size(a: Arc<dyn ExecutionPlan>) -> usize {
+	1 + a.children().into_iter().cloned().map(plan_size).sum::<usize>()
+}
+
 fn format_plan(
 	f: &mut std::fmt::Formatter<'_>,
 	plan: Arc<dyn ExecutionPlan>,
@@ -46,6 +50,10 @@ pub struct Plan {
 impl Plan {
 	pub fn new(tree: Arc<dyn ExecutionPlan>, est_cost: f64) -> Self {
 		Self { tree, est_cost } 
+	}
+
+	pub fn size(&self) -> usize {
+		plan_size(self.tree.clone())
 	}
 }
 

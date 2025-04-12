@@ -113,7 +113,7 @@ pub struct OptdOldBackend {
 
 impl OptdOldBackend {
 	pub async fn new(
-		tables: &Vec<(String, Arc<MemTable>)>,
+		tables: Arc<dyn SchemaProvider>,
 		strat: SampleStrategy
 	) -> Result<Self> {
 		if strat == SampleStrategy::HintBased {
@@ -124,12 +124,8 @@ impl OptdOldBackend {
 		let session_config = SessionConfig::from_env()?
 			.with_information_schema(true)
 			.with_create_default_catalog_and_schema(false);
-		let schem_prov = MemorySchemaProvider::new();
-		for (name, table) in tables {
-			schem_prov.register_table(name.to_string(), table.clone())?;
-		}
 		let mem_prov = MemoryCatalogProvider::new();
-		mem_prov.register_schema("public", Arc::new(schem_prov))?;
+		mem_prov.register_schema("public", tables)?;
 		let mem_prov_list = MemoryCatalogProviderList::new();
 		mem_prov_list.register_catalog("datafusion".to_string(), Arc::new(mem_prov));
 		
@@ -231,6 +227,7 @@ impl OptdOldBackend {
 			let winfo = opt.cascades_optimizer.memo.get_group_winner(gid)
 				.as_full_winner().unwrap().clone();
 			opt_ctx.optimizer = Some(&opt);
+
 			let phys_plan = opt_ctx.conv_from_optd_og(opt_plan, meta).await?;
 			let cost = winfo.total_cost.0[COMPUTE_COST];
 			let phys_plan = Plan::new(phys_plan, cost);			
@@ -340,15 +337,14 @@ pub struct SampleOutput {
 	/// Datafusion session.
 	pub session: SessionState,
 	/// Schemas of each table.
-	pub raw_tables: Vec<(String, Schema)>,
+	pub tables: Arc<dyn SchemaProvider>,
 }
 
 /// Input to sampler.
 pub struct QueryInfo {
 	/// Logical plan of query to optimize.
 	pub plan: LogicalPlan,	
-	pub tables: Vec<(String, Arc<MemTable>)>,
-	pub raw_tables: Vec<(String, Schema)>,	
+	pub tables: Arc<dyn SchemaProvider>,
 	pub backend: Arc<dyn Sampler>,
 	pub state: SessionState,
 }
@@ -359,7 +355,7 @@ pub async fn sample(mut query: QueryInfo, _cfg: SampleConfig) -> Result<SampleOu
 		best_plan: backend.get_best(&query.state, query.plan).await?,
 		alternates: backend.get_alternates(&query.state).await?,
 		session: query.state,
-		raw_tables: query.raw_tables
+		tables: query.tables,
 	})
 }		
 

@@ -7,8 +7,11 @@ use std::sync::Arc;
 use std::time::{Instant, Duration};
 
 use datafusion::arrow::datatypes::Schema;
-use datafusion::datasource::MemTable;
-use datafusion::prelude::SessionContext;
+use datafusion::catalog::TableProvider;
+use datafusion::datasource::listing::{ListingTable, ListingTableConfig, ListingTableUrl};
+use datafusion::execution::options::ReadOptions;
+use datafusion::prelude::{CsvReadOptions, SessionContext};
+use datafusion::sql::TableReference;
 use datafusion_proto::bytes::physical_plan_from_bytes;
 use optdbg::benchmark::BenchmarkConfig;
 
@@ -17,6 +20,7 @@ use async_recursion::async_recursion;
 use clap::Parser;
 use datafusion::arrow::array::RecordBatch;
 use datafusion::{execution::TaskContext, physical_plan::{collect, ExecutionPlan}};
+use optdbg::common::PlanMeasurements;
 
 async fn time_subplan(
 	node: Arc<dyn ExecutionPlan>,
@@ -116,24 +120,34 @@ async fn main() -> anyhow::Result<()> {
 
 	let schema_bytes = std::fs::read(Path::new(&args.schemas_path))?;
 	let schemas: Vec<(String, Schema)> = serde_json::from_slice(&schema_bytes)?;
-
-	let mut tables = Vec::new();
+	
+	let df_ctx = SessionContext::new();
 	for tableref in schemas {
-		let schemaref = Arc::new(tableref.1);
-		tables.push((
-			tableref.0,
-			Arc::new(MemTable::try_new(schemaref.clone(), vec![vec![]])?)
-		));
-	}
-	
-	let ctx = SessionContext::new();
-	for (name, table) in &tables {
-		ctx.register_table(name, table.clone())?;
-	}
-	
+		let options = CsvReadOptions::new().delimiter(b'|').quote(b'"')
+			.schema(&tableref.1);
+		let path = format!("./tpch-data/{}.csv", tableref.0);
+		let table_path = std::path::Path::new(&path).canonicalize()?;
+		df_ctx.register_csv(tableref.0, table_path.to_str().unwrap(), options).await?;
+	}	
+
 	let plan_bytes = std::fs::read(Path::new(&args.plan_path))?;
-	println!("sad!");
-	// let physical_round_trip = physical_plan_from_bytes(&plan_bytes, &ctx)?;
+	let plan = physical_plan_from_bytes(&plan_bytes, &df_ctx)?;
+	let mut cards = Vec::new();
+	let mut times = Vec::new();
+	measure_subplan(plan, df_ctx.task_ctx(), &cfg, &mut cards, &mut times).await?;
+	if let Some(time) = times[0] {
+		println!("got time {}ms", time.as_millis());
+	} else {
+		println!("timed out!");
+	}
+	
+	let measures = PlanMeasurements {
+		cardinalities: cards,
+		sub_runtimes: Some(times),
+	};
+	let serialized = serde_json::to_string(&measures)?;
+	std::fs::write(&args.output_path, &serialized)?;
+	
 	// println!("{:?}", physical_round_trip);
 	Ok(())
 }
