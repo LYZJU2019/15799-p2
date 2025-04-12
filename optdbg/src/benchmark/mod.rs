@@ -1,9 +1,11 @@
 use std::sync::Arc;
 use std::time::{Instant, Duration};
 
+use datafusion::arrow::array::RecordBatch;
 use datafusion::{execution::TaskContext, physical_plan::{collect, ExecutionPlan}};
 use anyhow::Result;
 use async_recursion::async_recursion;
+use itertools::Itertools;
 
 use crate::sampling::{Plan, SampleOutput};
 
@@ -18,12 +20,14 @@ pub struct OptimizerMetrics;
 /// Plan annotated with runtimes / cardinalities.
 pub struct MeasuredPlan {
 	pub plan: Plan,
-	/// Time it took to run the overall plan.
-	pub runtime: Duration,
+	/// Time it took to run the overall plan. None if timeout hit.
+	pub runtime: Option<Duration>,
 	/// Preorder array of each subplan's true cardinality.
-	pub cardinalities: Vec<usize>,
+	pub cardinalities: Vec<Option<usize>>,
 	/// Preorder array of each subplan's runtime.
-	pub sub_runtimes: Option<Vec<Duration>>,
+	// outer Option semantically means "we may not have ran this query"
+	// inner Options semantically mean "we ran query and it timed out / died"
+	pub sub_runtimes: Option<Vec<Option<Duration>>>,
 }
 
 pub struct BenchmarkOutput {
@@ -33,6 +37,43 @@ pub struct BenchmarkOutput {
 	pub chosen_idx: usize,
 	/// Global optimizer metrics.
 	pub metrics: OptimizerMetrics,
+}
+
+async fn time_subplan(
+	node: Arc<dyn ExecutionPlan>,
+	ctx: Arc<TaskContext>,
+	timeout: Option<Duration>,
+) -> Result<Option<(Vec<RecordBatch>, Duration)>> {
+	let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+	let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+	if let Some(timeout) = timeout {
+		let (node, ctx) = (node.clone(), ctx.clone());
+		let blocking_task = tokio::task::spawn(async move {
+			let before = Instant::now();
+			let out = collect(node, ctx).await;
+			let after = Instant::now();
+			let _ = result_tx.send((out, after-before));
+		});
+		tokio::spawn(async move {
+			tokio::time::sleep(timeout).await;
+			let _ = cancel_tx.send(());
+		});
+		tokio::select! {
+			result = result_rx => {
+				let (res, time) = result?;
+				Ok(Some((res?, time)))
+			}
+			_ = cancel_rx => {
+				Ok(None)
+			}
+		}
+	} else {
+		let (node, ctx) = (node.clone(), ctx.clone());
+		let before = Instant::now();
+		let out = collect(node, ctx).await;
+		let after = Instant::now();
+		Ok(Some((out?, after-before)))
+	}
 }
 
 /// Recursively populate cardinality and runtime arrays.
@@ -48,19 +89,16 @@ async fn measure_subplan(
 	node: Arc<dyn ExecutionPlan>,
 	ctx: Arc<TaskContext>,
 	cfg: &BenchmarkConfig,
-	cards: &mut Vec<usize>,
-	times: &mut Vec<Duration>
+	cards: &mut Vec<Option<usize>>,
+	times: &mut Vec<Option<Duration>>,
 ) -> Result<()> {
-	let future = collect(node.clone(), ctx.clone());
-	let before = Instant::now();
-	let batches = if let Some(timeout) = cfg.timeout {
-		tokio::time::timeout(timeout, future).await??
+	if let Some((batches, time)) = time_subplan(node.clone(), ctx.clone(), cfg.timeout).await? {
+		cards.push(Some(batches.iter().map(|x| x.num_rows()).sum()));
+		times.push(Some(time));
 	} else {
-		future.await?
-	};
-	let after = Instant::now();
-	cards.push(batches.iter().map(|x| x.num_rows()).sum());
-	times.push(after-before);
+		cards.push(None);
+		times.push(None);
+	}
 	for child in node.children() {
 		measure_subplan(child.clone(), ctx.clone(), cfg, cards, times).await?;
 	}
@@ -75,8 +113,18 @@ async fn measure_plan(
 ) -> Result<MeasuredPlan> {
 	let mut cardinalities = Vec::new();
 	let mut runtimes = Vec::new();
-	measure_subplan(plan.tree.clone(), ctx, cfg, &mut cardinalities, &mut runtimes).await?;
-	println!("{}ms", runtimes[0].as_millis());
+	// FIXME temporary hack to get around OOMs
+	if plan.est_cost < 1000000000.0 {
+		measure_subplan(plan.tree.clone(), ctx, cfg, &mut cardinalities, &mut runtimes).await?;
+	} else {
+		cardinalities.push(None);
+		runtimes.push(None);
+	}
+	if let Some(runtime) = runtimes[0] {
+		println!("ran plan in {}ms (est cost {})", runtime.as_millis(), plan.est_cost);
+	} else {
+		println!("plan timed out (est cost {})", plan.est_cost);
+	}
 	Ok(MeasuredPlan {
 		plan,
 		runtime: runtimes[0],
@@ -90,10 +138,11 @@ pub async fn benchmark(sample: SampleOutput, cfg: BenchmarkConfig) -> Result<Ben
 	let mut out = Vec::new();
 	// TODO best measurement should definitely be interleaved in to avoid
 	// warmup time affecting measurements or something like that...
-	for plan in sample.alternates {
+	let best = measure_plan(sample.best_plan, ctx.clone(), &cfg).await?;
+	for plan in sample.alternates.into_iter()
+		.sorted_by(|x, y| x.est_cost.partial_cmp(&y.est_cost).unwrap()) {
 		out.push(measure_plan(plan, ctx.clone(), &cfg).await?);
 	}
-	let best = measure_plan(sample.best_plan, ctx.clone(), &cfg).await?;
 	out.sort_by(|x, y| x.runtime.cmp(&y.runtime));
 	let chosen_idx = out.iter()
 		.position(|x| x.runtime > best.runtime).unwrap_or(out.len());

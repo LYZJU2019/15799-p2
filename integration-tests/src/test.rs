@@ -30,7 +30,7 @@ from
 	(
 		select
 			n_name as nation,
-			l_extendedprice * (1 - l_discount) - ps_supplycost * l_quantity as amount
+			l_extendedprice - ps_supplycost * l_quantity as amount
 		from
 			part,
 			supplier,
@@ -55,7 +55,7 @@ LIMIT 1;
 	let s_cfg = SampleConfig;
 
 	let b_cfg = BenchmarkConfig {
-		timeout: None,
+		timeout: Some(std::time::Duration::from_millis(50)),
 		fast: false,
 	};
 
@@ -64,31 +64,31 @@ LIMIT 1;
 	let mut tables = Vec::new();
 	for tableref in tpch_schemas() {
 		let schemaref = Arc::new(tableref.schema);
-		// let object_store = Arc::new(LocalFileSystem::new());
-		// println!("reading {}", tableref.name);
-		// let path = format!("./tpch-data/{}.tbl", tableref.name);
-		// let path = std::path::Path::new(&path).canonicalize()?;
-		// let scan_config = FileScanConfig::new(
-		// 	ObjectStoreUrl::local_filesystem(),
-		// 	schemaref.clone(),
-		// 	Arc::new(CsvSource::default())
-		// ).with_file(PartitionedFile::new(
-		// 	path.display().to_string(), 10
-		// ));
-		// let config = CsvSource::new(true, b'|', b'"')
-		// 	.with_batch_size(8192)
-		// 	.with_schema(schemaref.clone());
-		// let opener = config
-		// 	.create_file_opener(object_store, &scan_config, 0);
-		// let mut result = vec![];
-		// let mut stream =
-		// 	FileStream::new(&scan_config, 0, opener, &ExecutionPlanMetricsSet::new())?;
-		// while let Some(batch) = stream.next().await.transpose()? {
-		// 	result.push(batch);
-		// }
+		let object_store = Arc::new(LocalFileSystem::new());
+		println!("loading {}", tableref.name);
+		let path = format!("./tpch-data/{}.tbl", tableref.name);
+		let path = std::path::Path::new(&path).canonicalize()?;
+		let scan_config = FileScanConfig::new(
+			ObjectStoreUrl::local_filesystem(),
+			schemaref.clone(),
+			Arc::new(CsvSource::default())
+		).with_file(PartitionedFile::new(
+			path.display().to_string(), 10
+		));
+		let config = CsvSource::new(true, b'|', b'"')
+			.with_batch_size(8192)
+			.with_schema(schemaref.clone());
+		let opener = config
+			.create_file_opener(object_store, &scan_config, 0);
+		let mut result = vec![];
+		let mut stream =
+			FileStream::new(&scan_config, 0, opener, &ExecutionPlanMetricsSet::new())?;
+		while let Some(batch) = stream.next().await.transpose()? {
+			result.push(batch);
+		}
 		tables.push((
 			tableref.name,
-			Arc::new(MemTable::try_new(schemaref.clone(), vec![vec![]])?)
+			Arc::new(MemTable::try_new(schemaref.clone(), vec![result])?)
 		));
 	}	
 
@@ -103,7 +103,7 @@ LIMIT 1;
 	let query = QueryInfo {
 		plan,
 		backend: Arc::new(OptdOldBackend::new(
-			&tables, SampleStrategy::RuleBased
+			&tables, SampleStrategy::RuleBased(Some(8))
 		).await?),
 		state,
 		tables,

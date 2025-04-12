@@ -19,5 +19,6 @@ datafusion-dolomite-integration = { path = "./datafusion-dolomite/datafusion-dol
 async-recursion = "1.1.1"
 async-trait = "0.1.88"
 itertools = "0.14.0"
+gag = "1.0.0"
 
 

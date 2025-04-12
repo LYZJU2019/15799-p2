@@ -22,6 +22,7 @@ pub fn compare_plans(_a: &MeasuredPlan, _b: &MeasuredPlan) -> () {
 pub fn analyze(bench: BenchmarkOutput, _cfg: AnalysisConfig) -> Report {
 	let chosen = &bench.plans[bench.chosen_idx];
 	for plan in &bench.plans[..bench.chosen_idx] {
+		println!("optimal plan not chosen!");
 		compare_plans(chosen, plan);
 	}
 	Report
