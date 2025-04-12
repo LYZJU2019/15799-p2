@@ -1,6 +1,3 @@
-use std::sync::Arc;
-use datafusion::physical_plan::ExecutionPlan;
-
 use crate::benchmark::{BenchmarkOutput, MeasuredPlan};
 
 // Placeholder type.

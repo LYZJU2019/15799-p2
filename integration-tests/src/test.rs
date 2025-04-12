@@ -1,13 +1,16 @@
 use std::sync::Arc;
 
+use datafusion::datasource::listing::{ListingTable, ListingTableConfig, ListingTableUrl};
 use datafusion::datasource::physical_plan::FileScanConfig;
 use datafusion::datasource::MemTable;
+use datafusion::prelude::CsvReadOptions;
 use datafusion::{
 	datasource::{listing::PartitionedFile, physical_plan::{CsvSource, FileSource, FileStream}},
 	execution::context::{SessionConfig, SessionContext}, physical_plan::metrics::ExecutionPlanMetricsSet
 };
+use datafusion_common::TableReference;
 use datafusion_execution::object_store::ObjectStoreUrl;
-use optdbg::sampling::{OptdOldBackend, SampleStrategy};
+use optdbg::sampling::{OptdOldBackend, SampleStrategy, RuleBailStrategy};
 use optdbg::{
 	analysis::AnalysisConfig, benchmark::BenchmarkConfig,
 	sampling::{SampleConfig, QueryInfo}
@@ -62,6 +65,8 @@ LIMIT 1;
 	let a_cfg = AnalysisConfig;
 
 	let mut tables = Vec::new();
+	let config = SessionConfig::default();
+	let df_ctx = SessionContext::new_with_config(config);
 	for tableref in tpch_schemas() {
 		let schemaref = Arc::new(tableref.schema);
 		let object_store = Arc::new(LocalFileSystem::new());
@@ -86,27 +91,44 @@ LIMIT 1;
 		while let Some(batch) = stream.next().await.transpose()? {
 			result.push(batch);
 		}
+		
+		// let options = CsvReadOptions::new().delimiter("|").quote('"');
+		// let listing_options = options
+        //     .to_listing_options(&self.copied_config(), self.copied_table_options());
+
+		// let table_ref = TableReference::partial(tablschema, tableref.name);
+		
+		// df_ctx.register_table(name, table.clone())?;
+		// let table_path = ListingTableUrl::parse(table_path)?;
+        
+        // let config = ListingTableConfig::new(table_path)
+        //     .with_listing_options(options)
+        //     .with_schema(schemaref);
+
+        // let table = ListingTable::try_new(config)?.with_definition(sql_definition);
+        // self.register_table(table_ref, Arc::new(table))?;
+		
 		tables.push((
 			tableref.name,
 			Arc::new(MemTable::try_new(schemaref.clone(), vec![result])?)
 		));
 	}	
 
-	let config = SessionConfig::default();
-	let df_ctx = SessionContext::new_with_config(config);
 	for (name, table) in &tables {
 		df_ctx.register_table(name, table.clone())?;
 	}
 	let df = df_ctx.sql(tpch_query_9).await?;
+	
 	let (state, plan) = df.into_parts();
 
 	let query = QueryInfo {
 		plan,
 		backend: Arc::new(OptdOldBackend::new(
-			&tables, SampleStrategy::RuleBased(Some(8))
+			&tables, SampleStrategy::RuleBased(RuleBailStrategy::Threshold(8))
 		).await?),
 		state,
 		tables,
+		raw_tables: tpch_schemas().into_iter().map(|x| (x.name, x.schema)).collect(),
 	};
 	
 	optdbg::report_query(query, s_cfg, b_cfg, a_cfg).await?;

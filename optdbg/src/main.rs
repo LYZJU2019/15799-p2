@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use clap::Parser;
 
+mod common;
 mod sampling;
 mod benchmark;
 mod analysis;

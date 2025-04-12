@@ -1,6 +1,7 @@
 use anyhow::Result;
 use sampling::QueryInfo;
 
+pub mod common;
 pub mod sampling;
 pub mod benchmark;
 pub mod analysis;

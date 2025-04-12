@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
-use datafusion::catalog::{CatalogProvider, CatalogProviderList, MemoryCatalogProvider, MemoryCatalogProviderList, MemorySchemaProvider, SchemaProvider};
+use datafusion::arrow::datatypes::Schema;
+use datafusion::catalog::{CatalogProvider, CatalogProviderList, MemoryCatalogProvider, MemoryCatalogProviderList, MemorySchemaProvider, SchemaProvider, TableProvider};
 use datafusion::datasource::MemTable;
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::execution::SessionState;
@@ -24,69 +25,27 @@ use optd_og_datafusion_repr::properties::schema::SchemaPropertyBuilder;
 use optd_og_datafusion_repr::rules;
 use optd_og_datafusion_repr::DatafusionOptimizer;
 
-// TODO find a way to compare plan properties?
-fn eq_plans(a: Arc<dyn ExecutionPlan>, b: Arc<dyn ExecutionPlan>) -> bool {
-	if a.name() != b.name() {
-		return false;
-	}
-	let a_childs = a.children();
-	let b_childs = b.children();
-	if a_childs.len() != b_childs.len() {
-		return false;
-	}
-	for (i,j) in a_childs.into_iter().zip(b_childs.into_iter()) {
-		if !eq_plans(i.clone(), j.clone()) {
-			return false;
-		}
-	}
-	return true;
+use crate::common::Plan;
+
+/// Enum representing how to decide when to stop trying out combinations of rules.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RuleBailStrategy {
+	/// Stop when we run out of rule combinations.
+	Never,
+	/// Stop when no new plans found after n attempts (TODO @Yu this is just a placeholder)
+	Inactive(usize),
+	/// Stop when n new plans have been found.
+	Threshold(usize),	
 }
 
-fn format_plan(
-	f: &mut std::fmt::Formatter<'_>,
-	plan: Arc<dyn ExecutionPlan>,
-	indent_level: usize
-) -> std::fmt::Result {
-	for _ in 0..indent_level {
-		write!(f, "  ")?;
-	}
-	writeln!(f, "{}", plan.name())?;
-	for child in plan.children() {
-		format_plan(f, child.clone(), indent_level + 1)?;
-	}
-	Ok(())
-}
-
-#[derive(Clone)]
-pub struct Plan {
-	pub tree: Arc<dyn ExecutionPlan>,
-	pub est_cost: f64,
-}
-
-impl Plan {
-	fn new(tree: Arc<dyn ExecutionPlan>, est_cost: f64) -> Self {
-		Self { tree, est_cost } 
-	}
-}
-
-impl std::cmp::PartialEq for Plan {
-	fn eq(&self, other: &Self) -> bool {
-		eq_plans(self.tree.clone(), other.tree.clone()) && self.est_cost == other.est_cost
-	}
-}
-
-impl std::cmp::Eq for Plan {}
-
-impl std::fmt::Display for Plan {
-	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-		format_plan(f, self.tree.clone(), 0)
-	}
-}
-
-#[derive(Clone, Debug)]
+/// Enum representing how we should sample alternative plans from the query optimizer;
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SampleStrategy {
+	/// Create alternative plans by extracting equivalent expressions from memo table.
 	MemoBased,
-	RuleBased(Option<usize>),
+	/// Create alternative plans trying out different combinations of rules.
+	RuleBased(RuleBailStrategy),
+	/// Create alternative plans by using different optimization hints.
 	HintBased
 }
 
@@ -95,23 +54,29 @@ impl std::str::FromStr for SampleStrategy {
 	fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
 		match s.to_lowercase().as_str() {
 			"memo" => Ok(SampleStrategy::MemoBased),
-			"rule" => Ok(SampleStrategy::RuleBased(None)),
+			"rule" => Ok(SampleStrategy::RuleBased(RuleBailStrategy::Never)),
 			"hint" => Ok(SampleStrategy::HintBased),
 			_ => Err("unknown backend")
 		}
 	}
 }
 
+/// Main trait for a query optimizer backend to implement.
 #[async_trait]
 pub trait Sampler {
+	/// Gets the plan a query optimizer would choose for a logical plan.
 	async fn get_best(&mut self, st: &SessionState, pl: LogicalPlan) -> Result<Plan>;
 
-	/// Must be called after Sampler::get_best().
+	/// Gets the other possible plans a query optimizer could choose for a logical plan.
+	/// Must be called after Sampler::get_best(). Output Must not contain the result of Sampler::get_best().
 	async fn get_alternates(&mut self, st: &SessionState) -> Result<Vec<Plan>>;
 }
 
+/// Backend for new optd.
 pub struct OptdBackend {
+	/// Plan given in get_best().
 	plan: Option<LogicalPlan>,
+	/// Strategy to use when sampling.
 	strat: SampleStrategy
 }
 
@@ -132,11 +97,17 @@ impl Sampler for OptdBackend {
 	}
 }
 
+/// Backend for old optd.
 pub struct OptdOldBackend {
+	/// Datafusion context. Needed to hold optimizer + catalog.
 	df_ctx: OptdDfContext,
+	/// Sampling strategy to use.
 	strat: SampleStrategy,
+	/// Plan passed in get_best().
 	plan: Option<LogicalPlan>,
+	/// Optimizer resulting from take() operation in get_best(). 
 	opt: Option<DatafusionOptimizer>,
+	/// Physical plan returned by get_best().
 	best: Option<Plan>,
 }
 
@@ -144,7 +115,11 @@ impl OptdOldBackend {
 	pub async fn new(
 		tables: &Vec<(String, Arc<MemTable>)>,
 		strat: SampleStrategy
-	) -> Result<Self> {		
+	) -> Result<Self> {
+		if strat == SampleStrategy::HintBased {
+			return Err(anyhow::anyhow!("optd-old doesn't support optimization hints"));
+		}
+		
 		let rt_config = RuntimeEnvBuilder::new();
 		let session_config = SessionConfig::from_env()?
 			.with_information_schema(true)
@@ -176,7 +151,17 @@ impl OptdOldBackend {
 		})
 	}
 
-	async fn get_alts_rule(&mut self, st: &SessionState, thres: Option<usize>) -> Result<Vec<Plan>> {
+	/// Implements rule-based sampling for optd-old backend.
+	// TODO Be a lot smarter about this: can pre-filter rules for applicability,
+	// can sort rules in the thresholding case, can hash trees for speedier equality checks,
+	// can probably see if this doing anything else dumb, Generally hacky.
+	//
+	// TODO implement support for RuleBailStrategy::Inactive or something	
+	async fn get_alts_rule(
+		&mut self,
+		st: &SessionState,
+		bail: RuleBailStrategy
+	) -> Result<Vec<Plan>> {
 		let opt = self.opt.as_mut().unwrap();
 		let pl = self.plan.clone().unwrap();
 		let mut out = Vec::new();
@@ -241,9 +226,7 @@ impl OptdOldBackend {
 			opt.cascades_optimizer.rules = Arc::from(
 				rs.into_iter().cloned().collect::<Vec<_>>().into_boxed_slice()
 			);
-			// opt.step_clear();			
-			// optd will dump stats if budget is exhausted, so shut it up
-			
+						
 			let (gid, opt_plan, meta) = opt.cascades_optimize(plan.clone())?;
 			let winfo = opt.cascades_optimizer.memo.get_group_winner(gid)
 				.as_full_winner().unwrap().clone();
@@ -256,7 +239,7 @@ impl OptdOldBackend {
 			if !out.contains(&phys_plan) && *self.best.as_ref().unwrap() != phys_plan {
 				println!("{}", phys_plan);
 				out.push(phys_plan);
-				if let Some(thres) = thres {
+				if let RuleBailStrategy::Threshold(thres) = bail {
 					if out.len() == thres {
 						break;
 					}
@@ -289,18 +272,22 @@ impl Sampler for OptdOldBackend {
 		Ok(out)
 	}
 
-	// TODO 
 	async fn get_alternates(&mut self, st: &SessionState) -> Result<Vec<Plan>> {
-		match self.strat {
-			SampleStrategy::RuleBased(t) => self.get_alts_rule(st, t).await,
-			_ => todo!()
+		match &self.strat {
+			SampleStrategy::RuleBased(t) => self.get_alts_rule(st, *t).await,
+			SampleStrategy::MemoBased => todo!(),
+			_ => unreachable!()
 		}
 	}
 }
 
+/// Backend for the datafusion-dolomite optimizer.
 pub struct DolomiteBackend {
+	/// Optimizer created when get_best() is called. 
 	opt: Option<DolomiteCascadesOptimizer>,
+	/// Sampling strategy to use.
 	strat: SampleStrategy,
+	/// State of datafusion session.
 	state: SessionState,
 }
 
@@ -314,6 +301,7 @@ impl DolomiteBackend {
 impl Sampler for DolomiteBackend {
 	async fn get_best(&mut self, st: &SessionState , pl: LogicalPlan) -> Result<Plan> {
 		let plan = dolomite_conversion::from_df_logical(&pl)?;
+		// We make the optimizer down here because it needs to take in a plan.
 		let mut opt = DolomiteCascadesOptimizer::default(plan);
 		opt.rules.extend(vec![
 			dolomite::rules::Join2HashJoinRule::new().into(),
@@ -335,23 +323,32 @@ impl Sampler for DolomiteBackend {
 		Ok(out)
 	}
 
-	// TODO 
 	async fn get_alternates(&mut self, st: &SessionState) -> Result<Vec<Plan>> {
-		Ok(vec![])
+		todo!()
 	}
 }
 
+// Placeholder type for when any settings are introduced. In practice this probably isn't needed.
 pub struct SampleConfig;
 
+/// Output of sampler.
 pub struct SampleOutput {
+	/// Plan chosen by the query optimizer.
 	pub best_plan: Plan,
+	/// Alternative plans not chosen by the query optimizer.
 	pub alternates: Vec<Plan>,
+	/// Datafusion session.
 	pub session: SessionState,
+	/// Schemas of each table.
+	pub raw_tables: Vec<(String, Schema)>,
 }
 
+/// Input to sampler.
 pub struct QueryInfo {
-	pub plan: LogicalPlan,
-	pub tables: Vec<(String, Arc<MemTable>)>,	
+	/// Logical plan of query to optimize.
+	pub plan: LogicalPlan,	
+	pub tables: Vec<(String, Arc<MemTable>)>,
+	pub raw_tables: Vec<(String, Schema)>,	
 	pub backend: Arc<dyn Sampler>,
 	pub state: SessionState,
 }
@@ -362,6 +359,7 @@ pub async fn sample(mut query: QueryInfo, _cfg: SampleConfig) -> Result<SampleOu
 		best_plan: backend.get_best(&query.state, query.plan).await?,
 		alternates: backend.get_alternates(&query.state).await?,
 		session: query.state,
+		raw_tables: query.raw_tables
 	})
 }		
 
