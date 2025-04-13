@@ -286,9 +286,14 @@ impl OptdOldBackend {
 			Arc::new(rules::JoinAssocRule::new()),
 		];
 		
+		let mut opt_ctx = OptdPlanContext::new(st);
+		let plan = opt_ctx.conv_into_optd_og(&pl)?;
+		let plan = opt.heuristic_optimize(plan);
+		let catalog = Arc::new(DatafusionCatalog::new(self.df_ctx.catalog.clone()));
+		let convs = rules::PhysicalConversionRule::all_conversions();
+
 		for mut rs in defaults.iter().powerset() {
-			let temp = rules::PhysicalConversionRule::all_conversions();
-			rs.extend(temp.iter());
+			rs.extend(convs.iter());
 			rs.extend(needed.iter());
 
 			// println!("Trying out {:?}",
@@ -300,16 +305,10 @@ impl OptdOldBackend {
 			let gag = gag::Gag::stdout().unwrap();
 
 			// Rebuilding optimizer is probably not necessary but it was the first thing that started working.
-			let mut opt_ctx = OptdPlanContext::new(st);
-			let plan = opt_ctx.conv_into_optd_og(&pl)?;
-			let plan = opt.heuristic_optimize(plan);
-
-			let catalog = Arc::new(DatafusionCatalog::new(self.df_ctx.catalog.clone()));
-
 			let mut opt = if let Some(stats) = &self.stats {
-				new_physical_adv_cost(catalog, stats.clone(), false)
+				new_physical_adv_cost(catalog.clone(), stats.clone(), false)
 			} else {
-				DatafusionOptimizer::new_physical(catalog, false)
+				DatafusionOptimizer::new_physical(catalog.clone(), false)
 			};
 			
 			opt.cascades_optimizer.rules = Arc::from(
@@ -321,9 +320,11 @@ impl OptdOldBackend {
 			let mut cards = Vec::new();
 			let mut costs = Vec::new();
 			Self::get_costs_and_cards(gid, &opt, &mut costs, &mut cards).await;
-			
-			opt_ctx.optimizer = Some(&opt);
 
+			let mut opt_ctx = OptdPlanContext::new(st);
+			// This changes some state within the optimizer somewhere. Dunno what, though.
+			opt_ctx.conv_into_optd_og(&pl)?;
+			opt_ctx.optimizer = Some(&opt);
 			let phys_plan = opt_ctx.conv_from_optd_og(opt_plan, meta).await?;
 			let phys_plan = Plan::new(phys_plan, costs, cards);			
 
