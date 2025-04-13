@@ -1,13 +1,14 @@
+//!
+//! Actual benchmarking script called by the benchmark process.
+//! This is it's own target because we need process isolation: oftentimes bad workloads
+//! are *so* bad that they will OOM and get the entire process killed (which sucks for us).
+//!
 use std::path::Path;
-/// Actual benchmarking script called by the benchmark process.
-/// This is it's own target because we need process isolation: oftentimes bad workloads
-/// are *so* bad that they will OOM and get the entire process killed (which sucks for us).
-
 use std::sync::Arc;
 use std::time::{Instant, Duration};
 
 use datafusion::arrow::datatypes::Schema;
-use datafusion::prelude::{CsvReadOptions, ParquetReadOptions, SessionContext};
+use datafusion::prelude::{ParquetReadOptions, SessionContext};
 use datafusion_proto::bytes::physical_plan_from_bytes;
 use optdbg::benchmark::BenchmarkConfig;
 
@@ -146,6 +147,5 @@ async fn main() -> anyhow::Result<()> {
 	let serialized = serde_json::to_string(&measures)?;
 	std::fs::write(&args.output_path, &serialized)?;
 	
-	// println!("{:?}", physical_round_trip);
 	Ok(())
 }

@@ -2,31 +2,24 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use async_recursion::async_recursion;
-use datafusion::arrow::datatypes::Schema;
-use datafusion::catalog::{CatalogProvider, CatalogProviderList, MemoryCatalogProvider, MemoryCatalogProviderList, MemorySchemaProvider, SchemaProvider, TableProvider};
-use datafusion::datasource::MemTable;
+use datafusion::catalog::{CatalogProvider, CatalogProviderList, MemoryCatalogProvider, MemoryCatalogProviderList, SchemaProvider};
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::execution::SessionState;
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::parquet::arrow::arrow_reader::{ArrowReaderMetadata, ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder};
-use datafusion::physical_plan::ExecutionPlan;
 use datafusion::execution::context::SessionConfig;
 use dolomite::cascades::CascadesOptimizer as DolomiteCascadesOptimizer;
 use dolomite::optimizer::Optimizer;
 use datafusion_dolomite_integration::conversion as dolomite_conversion;
 use anyhow::Result;
 use itertools::Itertools;
-use optd_og_core::cascades::{ExprId, GroupId, OptimizerProperties, RelNodeContext};
-use optd_og_core::logical_property::LogicalPropertyBuilderAny;
-use optd_og_core::nodes::PlanNodeOrGroup;
+use optd_og_core::cascades::GroupId;
 use optd_og_datafusion_bridge::{DatafusionCatalog, OptdDfContext, OptdPlanContext};
 use optd_og_core::{rules::Rule, cascades::{CascadesOptimizer as OptdCascadesOptimizer, Memo}};
 use optd_og_datafusion_repr::cost::base_cost::DfStatistics;
-use optd_og_datafusion_repr::cost::{AdaptiveCostModel, COMPUTE_COST};
+use optd_og_datafusion_repr::cost::COMPUTE_COST;
 use async_trait::async_trait;
-use optd_og_datafusion_repr::plan_nodes::{DfNodeType, DfPlanNode};
-use optd_og_datafusion_repr::properties::column_ref::ColumnRefPropertyBuilder;
-use optd_og_datafusion_repr::properties::schema::SchemaPropertyBuilder;
+use optd_og_datafusion_repr::plan_nodes::DfNodeType;
 use optd_og_datafusion_repr::rules;
 use optd_og_datafusion_repr::DatafusionOptimizer;
 use optd_og_datafusion_repr_adv_cost::adv_stats::stats::DataFusionPerTableStats;
@@ -118,7 +111,7 @@ pub struct OptdOldBackend {
 	opt: Option<DatafusionOptimizer>,
 	/// Physical plan returned by get_best().
 	best: Option<Plan>,
-	stats: DataFusionBaseTableStats,
+	stats: Option<DataFusionBaseTableStats>,
 }
 
 /// Taken from optd-perfbench (all credit to Alexis Schlomer).
@@ -192,31 +185,6 @@ fn gen_base_stats(tbl_paths: Vec<(String, PathBuf)>) -> anyhow::Result<DataFusio
 
     let stats = base_table_stats.into_inner();
     let l = stats.unwrap();
-    // Useful for debugging stats so I kept it
-    // l.iter().for_each(|(table_name, stats)| {
-    //     println!("Table: {} (num_rows: {})", table_name, stats.row_cnt);
-    //     stats
-    //         .column_comb_stats
-    //         .iter()
-    //         .sorted_by_key(|x| x.0[0])
-    //         .for_each(|x| {
-    //             let sum_freq: f64 = x.1.mcvs.frequencies().values().copied().sum();
-    //             println!(
-    //                 "Col: {} (n_distinct: {}) (n_frac: {}) (mcvs: {} {}) (tdigests: {:?} {:?}
-    // {:?} {:?} {:?})",                 x.0[0],
-    //                 x.1.ndistinct,
-    //                 x.1.null_frac,
-    //                 x.1.mcvs.frequencies().len(),
-    //                 sum_freq,
-    //                 x.1.distr.as_ref().map(|d| d.quantile(0.01)),
-    //                 x.1.distr.as_ref().map(|d| d.quantile(0.25)),
-    //                 x.1.distr.as_ref().map(|d| d.quantile(0.50)),
-    //                 x.1.distr.as_ref().map(|d| d.quantile(0.75)),
-    //                 x.1.distr.as_ref().map(|d| d.quantile(0.99)),
-    //             );
-    //         });
-    // });
-    // println!("{:#?}", stats);
 
     Ok(l)
 }
@@ -226,7 +194,8 @@ impl OptdOldBackend {
 	pub async fn new(
 		tables: Arc<dyn SchemaProvider>,
 		table_files: Vec<(String, PathBuf)>,
-		strat: SampleStrategy
+		strat: SampleStrategy,
+		adv: bool
 	) -> Result<Self> {
 		if strat == SampleStrategy::HintBased {
 			return Err(anyhow::anyhow!("optd-old doesn't support optimization hints"));
@@ -240,8 +209,10 @@ impl OptdOldBackend {
 		mem_prov.register_schema("public", tables)?;
 		let mem_prov_list = MemoryCatalogProviderList::new();
 		mem_prov_list.register_catalog("datafusion".to_string(), Arc::new(mem_prov));
-
-		let stats = gen_base_stats(table_files)?;
+		
+		let stats = if adv {
+			Some(gen_base_stats(table_files)?)
+		} else { None };
 		
 		let df_ctx = optd_og_datafusion_bridge::create_df_context(
 			Some(session_config.clone()),
@@ -249,8 +220,8 @@ impl OptdOldBackend {
 			Some(Arc::new(mem_prov_list)),
 			false,
 			false,
-			true,
-			Some(stats.clone()),
+			adv,
+			stats.clone(),
 		).await?;
 		Ok(Self {
 			df_ctx,
@@ -324,38 +295,23 @@ impl OptdOldBackend {
 			// 		 rs.clone().into_iter().map(|x| x.name())
 			// 		 .filter(|x| *x != "physical_conversion").collect::<Vec<_>>());
 			// optd will dump some info somewhere if budget is exhausted.
+
 			// NOTE: this blocks all println! calls! remember me when debugging!!
 			let gag = gag::Gag::stdout().unwrap();
-			// Avoid borrowing issue. Pretty hacky.
+
+			// Rebuilding optimizer is probably not necessary but it was the first thing that started working.
 			let mut opt_ctx = OptdPlanContext::new(st);
 			let plan = opt_ctx.conv_into_optd_og(&pl)?;
 			let plan = opt.heuristic_optimize(plan);
 
 			let catalog = Arc::new(DatafusionCatalog::new(self.df_ctx.catalog.clone()));
 
-			let mut opt = new_physical_adv_cost(catalog, self.stats.clone(), false);
+			let mut opt = if let Some(stats) = &self.stats {
+				new_physical_adv_cost(catalog, stats.clone(), false)
+			} else {
+				DatafusionOptimizer::new_physical(catalog, false)
+			};
 			
-			// let opt = OptdCascadesOptimizer::new_with_options(
-            //     rs.clone().into_iter().cloned().collect::<Vec<_>>(),
-            //     Box::new(AdaptiveCostModel::new(50)),
-            //     vec![
-            //         Box::new(SchemaPropertyBuilder::new(catalog.clone()))
-            //             as Box<dyn LogicalPropertyBuilderAny<DfNodeType>>,
-            //         Box::new(ColumnRefPropertyBuilder::new(catalog.clone()))
-            //             as Box<dyn LogicalPropertyBuilderAny<DfNodeType>>,
-            //     ]
-            //     .into(),
-            //     OptimizerProperties {
-            //         panic_on_budget: false,
-            //         partial_explore_iter: Some(1 << 18),
-            //         partial_explore_space: Some(1 << 14),
-            //         disable_pruning: false,
-            //         enable_tracing: false,
-            //     },
-            // );
-
-			// opt.cascades_optimizer = optim;
-
 			opt.cascades_optimizer.rules = Arc::from(
 				rs.into_iter().cloned().collect::<Vec<_>>().into_boxed_slice()
 			);
@@ -401,7 +357,6 @@ impl Sampler for OptdOldBackend {
 		Self::get_costs_and_cards(gid, &opt, &mut costs, &mut cards).await;
 		
 		opt_ctx.optimizer = Some(&opt);
-		println!("got output\n{plan}");
 		let phys_plan = opt_ctx.conv_from_optd_og(plan, meta).await?;
 		self.plan = Some(pl);
 		self.opt = Some(*opt);

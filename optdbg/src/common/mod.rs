@@ -21,7 +21,7 @@ fn eq_plans(a: Arc<dyn ExecutionPlan>, b: Arc<dyn ExecutionPlan>) -> bool {
 			return false;
 		}
 	}
-	return true;
+	true
 }
 
 /// Returns the number of nodes in a plan.
@@ -92,8 +92,8 @@ impl std::fmt::Display for Plan {
 
 #[derive(Clone, Copy, Error, Debug, PartialEq, Serialize, Deserialize)]
 pub enum MeasureError {
-	#[error("exhausted memory")]
-	OOM,
+	#[error("query failed")]
+	Died,
 	#[error("timed out")]
 	Timeout,
 }

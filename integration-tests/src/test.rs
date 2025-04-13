@@ -1,11 +1,7 @@
 use std::sync::Arc;
 
-use datafusion::datasource::listing::{ListingTable, ListingTableConfig, ListingTableUrl};
-use datafusion::execution::options::ReadOptions;
-use datafusion::prelude::{CsvReadOptions, ParquetReadOptions};
+use datafusion::prelude::ParquetReadOptions;
 use datafusion::execution::context::{SessionConfig, SessionContext};
-use datafusion_catalog::{MemorySchemaProvider, SchemaProvider, TableProvider};
-use datafusion_common::TableReference;
 use optdbg::sampling::{OptdOldBackend, SampleStrategy, RuleBailStrategy};
 use optdbg::{
 	analysis::AnalysisConfig, benchmark::BenchmarkConfig,
@@ -94,7 +90,8 @@ AND c_mktsegment = 'AUTOMOBILE'
 		backend: Arc::new(OptdOldBackend::new(
 			tables.clone(),
 			table_paths,
-			SampleStrategy::RuleBased(RuleBailStrategy::Threshold(10))
+			SampleStrategy::RuleBased(RuleBailStrategy::Threshold(10)),
+			true
 		).await?),
 		state,
 		tables,

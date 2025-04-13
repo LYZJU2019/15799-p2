@@ -136,12 +136,12 @@ async fn measure_plan(
 ) -> anyhow::Result<MeasuredPlan> {
 	let mut cardinalities = Vec::new();
 	let mut runtimes = Vec::new();
-	// FIXME temporary hack to get around OOMs
+	// FIXME temporary hack to get around OOMs. obviously not generic.
 	if plan.est_costs[0] < 1000000000.0 {
 		measure_subplan(plan.tree.clone(), ctx, cfg, &mut cardinalities, &mut runtimes).await?;
 	} else {
-		cardinalities.push(Err(MeasureError::OOM));
-		runtimes.push(Err(MeasureError::OOM));
+		cardinalities.push(Err(MeasureError::Died));
+		runtimes.push(Err(MeasureError::Died));
 	}
 	if let Ok(runtime) = runtimes[0] {
 		println!("ran plan in {}ms (est cost {})", runtime.as_millis(), plan.est_costs[0]);
@@ -171,7 +171,7 @@ async fn measure_plan_ipc(
 
 	let bytes = serde_json::to_string(cfg)?;
 	let mut cfg_file = tempfile::NamedTempFile::new()?;
-	cfg_file.write_all(&bytes.as_bytes())?;
+	cfg_file.write_all(bytes.as_bytes())?;
 
 	let mut schemas = Vec::new();
 	for i in tables.table_names() {
@@ -180,7 +180,7 @@ async fn measure_plan_ipc(
 	
 	let bytes = serde_json::to_string(&schemas)?;
 	let mut schema_file = tempfile::NamedTempFile::new()?;
-	schema_file.write_all(&bytes.as_bytes())?;
+	schema_file.write_all(bytes.as_bytes())?;
 
 	let out_file = tempfile::NamedTempFile::new()?;
 	// TODO need better solution than relative path lol
@@ -196,9 +196,9 @@ async fn measure_plan_ipc(
 		println!("died");
 		Ok(MeasuredPlan {
 			plan,
-			runtime: Err(MeasureError::OOM),
-			cardinalities: vec![Err(MeasureError::OOM); size],
-			sub_runtimes: Some(vec![Err(MeasureError::OOM); size]),
+			runtime: Err(MeasureError::Died),
+			cardinalities: vec![Err(MeasureError::Died); size],
+			sub_runtimes: Some(vec![Err(MeasureError::Died); size]),
 		})
 	} else {
 		let measurements: PlanMeasurements = serde_json::from_reader(out_file)?;
@@ -230,7 +230,7 @@ pub async fn benchmark(
 	});
 	let chosen_idx = out.iter()
 		.position(|x| x.runtime.is_err() ||
-				  !best.runtime.is_err() && x.runtime.unwrap() > best.runtime.unwrap())
+				  best.runtime.is_ok() && x.runtime.unwrap() > best.runtime.unwrap())
 		.unwrap_or(out.len());
 	out.insert(chosen_idx, best);
 	
