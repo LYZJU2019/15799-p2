@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use async_recursion::async_recursion;
 use datafusion::arrow::datatypes::Schema;
 use datafusion::catalog::{CatalogProvider, CatalogProviderList, MemoryCatalogProvider, MemoryCatalogProviderList, MemorySchemaProvider, SchemaProvider, TableProvider};
 use datafusion::datasource::MemTable;
@@ -13,13 +14,15 @@ use dolomite::optimizer::Optimizer;
 use datafusion_dolomite_integration::conversion as dolomite_conversion;
 use anyhow::Result;
 use itertools::Itertools;
-use optd_og_core::cascades::OptimizerProperties;
+use optd_og_core::cascades::{ExprId, GroupId, OptimizerProperties, RelNodeContext};
 use optd_og_core::logical_property::LogicalPropertyBuilderAny;
+use optd_og_core::nodes::PlanNodeOrGroup;
 use optd_og_datafusion_bridge::{DatafusionCatalog, OptdDfContext, OptdPlanContext};
 use optd_og_core::{rules::Rule, cascades::{CascadesOptimizer as OptdCascadesOptimizer, Memo}};
+use optd_og_datafusion_repr::cost::base_cost::DfStatistics;
 use optd_og_datafusion_repr::cost::{AdaptiveCostModel, COMPUTE_COST};
 use async_trait::async_trait;
-use optd_og_datafusion_repr::plan_nodes::DfNodeType;
+use optd_og_datafusion_repr::plan_nodes::{DfNodeType, DfPlanNode};
 use optd_og_datafusion_repr::properties::column_ref::ColumnRefPropertyBuilder;
 use optd_og_datafusion_repr::properties::schema::SchemaPropertyBuilder;
 use optd_og_datafusion_repr::rules;
@@ -147,6 +150,31 @@ impl OptdOldBackend {
 		})
 	}
 
+	#[async_recursion]
+	async fn get_est_cards(
+		node: Arc<DfPlanNode>,
+		opt: &DatafusionOptimizer,
+		cards: &mut Vec<f64>,
+	) -> optd_og_core::cost::Statistics {
+		let mut children = Vec::new();
+		for i in node.children.iter().rev() {
+			let PlanNodeOrGroup::PlanNode(p) = i else {
+				panic!("shouldn't see group after optimization");
+			};
+			children.push(Self::get_est_cards(p.clone(), opt, cards).await);
+		}
+		let children2: Vec<_> = (0..children.len()).rev().map(|x| &children[x]).collect();
+		let stats = opt.cascades_optimizer.cost.derive_statistics(
+			&node.typ, &node.predicates, children2.as_slice(),
+			RelNodeContext {
+				group_id: GroupId(0), expr_id: ExprId(0), children_group_ids: vec![]
+			},
+			&opt.cascades_optimizer,
+		);
+		cards.push(stats.0.downcast_ref::<DfStatistics>().unwrap().row_cnt);
+		stats
+	}
+
 	/// Implements rule-based sampling for optd-old backend.
 	// TODO Be a lot smarter about this: can pre-filter rules for applicability,
 	// can sort rules in the thresholding case, can hash trees for speedier equality checks,
@@ -186,12 +214,12 @@ impl OptdOldBackend {
 			rs.extend(temp.iter());
 			rs.extend(needed.iter());
 
-			println!("Trying out {:?}",
-					 rs.clone().into_iter().map(|x| x.name())
-					 .filter(|x| *x != "physical_conversion").collect::<Vec<_>>());
+			// println!("Trying out {:?}",
+			// 		 rs.clone().into_iter().map(|x| x.name())
+			// 		 .filter(|x| *x != "physical_conversion").collect::<Vec<_>>());
 			// optd will dump some info somewhere if budget is exhausted.
 			// NOTE: this blocks all println! calls! remember me when debugging!!
-			let gag = gag::Gag::stdout().unwrap();
+			// let gag = gag::Gag::stdout().unwrap();
 			// Avoid borrowing issue. Pretty hacky.
 			let mut opt_ctx = OptdPlanContext::new(st);
 			let plan = opt_ctx.conv_into_optd_og(&pl)?;
@@ -218,21 +246,27 @@ impl OptdOldBackend {
             );
 
 			opt.cascades_optimizer = optim;
-			
+
+				
 			opt.cascades_optimizer.rules = Arc::from(
 				rs.into_iter().cloned().collect::<Vec<_>>().into_boxed_slice()
 			);
 						
 			let (gid, opt_plan, meta) = opt.cascades_optimize(plan.clone())?;
+
+			let mut cards = Vec::new();
+			Self::get_est_cards(opt_plan.clone(), &opt, &mut cards).await;
+			cards.reverse();
+			
 			let winfo = opt.cascades_optimizer.memo.get_group_winner(gid)
 				.as_full_winner().unwrap().clone();
 			opt_ctx.optimizer = Some(&opt);
 
 			let phys_plan = opt_ctx.conv_from_optd_og(opt_plan, meta).await?;
 			let cost = winfo.total_cost.0[COMPUTE_COST];
-			let phys_plan = Plan::new(phys_plan, cost);			
+			let phys_plan = Plan::new(phys_plan, cost, cards);			
 
-			drop(gag);
+			// drop(gag);
 			if !out.contains(&phys_plan) && *self.best.as_ref().unwrap() != phys_plan {
 				println!("{}", phys_plan);
 				out.push(phys_plan);
@@ -258,12 +292,16 @@ impl Sampler for OptdOldBackend {
 		let (gid, plan, meta) = opt.cascades_optimize(plan)?;
 		let winfo = opt.cascades_optimizer.memo.get_group_winner(gid)
 			.as_full_winner().unwrap().clone();
+		let mut cards = Vec::new();
+		Self::get_est_cards(plan.clone(), &opt, &mut cards).await;
+		cards.reverse();
+		
 		opt_ctx.optimizer = Some(&opt);
 		let phys_plan = opt_ctx.conv_from_optd_og(plan, meta).await?;
 		let cost = winfo.total_cost.0[COMPUTE_COST];
 		self.plan = Some(pl);
 		self.opt = Some(*opt);
-		let out = Plan::new(phys_plan, cost);
+		let out = Plan::new(phys_plan, cost, cards);
 		self.best = Some(out.clone());
 		println!("best is\n{out}");
 		Ok(out)
@@ -315,7 +353,7 @@ impl Sampler for DolomiteBackend {
 			.unwrap().winner(&opt.required_prop)
 			.unwrap().lowest_cost.0;
 		self.opt = Some(opt);
-		let out = Plan::new(phys_plan, cost);
+		let out = Plan::new(phys_plan, cost, vec![]);
 		println!("best is\n{out}");
 		Ok(out)
 	}

@@ -29,32 +29,39 @@ fn plan_size(a: Arc<dyn ExecutionPlan>) -> usize {
 	1 + a.children().into_iter().cloned().map(plan_size).sum::<usize>()
 }
 
+
 /// Displays the name of each node in a plan with tree-style indentation.
-fn format_plan(
+fn format_plan_with_preorder_help<T: std::fmt::Display>(
 	f: &mut std::fmt::Formatter<'_>,
 	plan: Arc<dyn ExecutionPlan>,
-	indent_level: usize
+	indent_level: usize,
+	preorder_data: &Vec<T>,
+	index: &mut usize
 ) -> std::fmt::Result {
 	for _ in 0..indent_level {
 		write!(f, "  ")?;
 	}
-	writeln!(f, "{}", plan.name())?;
+	writeln!(f, "{} ({})", plan.name(), preorder_data[*index])?;
+	*index += 1;
 	for child in plan.children() {
-		format_plan(f, child.clone(), indent_level + 1)?;
+		format_plan_with_preorder_help(f, child.clone(), indent_level + 1, preorder_data, index)?;
 	}
 	Ok(())
 }
+
 
 /// Main wrapper type of a physical plan alongside estimated cost.
 #[derive(Clone)]
 pub struct Plan {
 	pub tree: Arc<dyn ExecutionPlan>,
 	pub est_cost: f64,
+	/// Preorder array of subplan estimated cardinalities.
+	pub est_cards: Vec<f64>,
 }
 
 impl Plan {
-	pub fn new(tree: Arc<dyn ExecutionPlan>, est_cost: f64) -> Self {
-		Self { tree, est_cost } 
+	pub fn new(tree: Arc<dyn ExecutionPlan>, est_cost: f64, est_cards: Vec<f64>) -> Self {
+		Self { tree, est_cost, est_cards } 
 	}
 
 	/// Get the number of nodes in a pln.
@@ -73,7 +80,8 @@ impl std::cmp::Eq for Plan {}
 
 impl std::fmt::Display for Plan {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-		format_plan(f, self.tree.clone(), 0)
+		let mut i = 0;
+		format_plan_with_preorder_help(f, self.tree.clone(), 0, &self.est_cards, &mut i)
 	}
 }
 

@@ -49,6 +49,17 @@ group by
 LIMIT 1;
 ";
 
+	let ex_tpch = "
+SELECT 1 FROM Lineitem, Orders, Customer
+WHERE l_orderkey = o_orderkey
+AND o_custkey = c_custkey
+AND l_shipdate > date '2008-01-01'
+AND l_receiptdate < date '2008-02-01'
+AND l_discount < 0.05
+AND o_orderpriority = 'HIGH'
+AND c_mktsegment = 'AUTOMOBILE'
+";
+
 	let s_cfg = SampleConfig;
 
 	let b_cfg = BenchmarkConfig {
@@ -69,16 +80,16 @@ LIMIT 1;
 		df_ctx.register_csv(tableref.name.clone(), table_path.to_str().unwrap(), options).await?;
 	}	
 
-	let df = df_ctx.sql(tpch_query_9).await?;
+	let df = df_ctx.sql(&tpch_query_9).await?;
 	
 	let (state, plan) = df.into_parts();
-
+	
 	let tables = df_ctx.state().schema_for_ref("part")?;	
 	let query = QueryInfo {
 		plan,
 		backend: Arc::new(OptdOldBackend::new(
 			tables.clone(),
-			SampleStrategy::RuleBased(RuleBailStrategy::Threshold(8))
+			SampleStrategy::RuleBased(RuleBailStrategy::Threshold(1))
 		).await?),
 		state,
 		tables,
