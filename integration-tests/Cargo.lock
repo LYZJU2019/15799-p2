@@ -2830,6 +2830,8 @@ dependencies = [
  "optd_og-core",
  "optd_og-datafusion-bridge",
  "optd_og-datafusion-repr",
+ "optd_og-datafusion-repr-adv-cost",
+ "rayon",
  "serde",
  "serde_json",
  "tempfile",

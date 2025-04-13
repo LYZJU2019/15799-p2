@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::{Instant, Duration};
 
 use datafusion::arrow::datatypes::Schema;
-use datafusion::prelude::{CsvReadOptions, SessionContext};
+use datafusion::prelude::{CsvReadOptions, ParquetReadOptions, SessionContext};
 use datafusion_proto::bytes::physical_plan_from_bytes;
 use optdbg::benchmark::BenchmarkConfig;
 
@@ -119,11 +119,13 @@ async fn main() -> anyhow::Result<()> {
 	let df_ctx = SessionContext::new();
 	// TODO TODO this is hardcoded very sad :( 
 	for tableref in schemas {
-		let options = CsvReadOptions::new().delimiter(b'|').quote(b'"')
-			.schema(&tableref.1);
-		let path = format!("./tpch-data/{}.csv", tableref.0);
+		let options = ParquetReadOptions::new().schema(&tableref.1);
+		let path = format!("./tpch-data/{}.parquet", tableref.0);
 		let table_path = std::path::Path::new(&path).canonicalize()?;
-		df_ctx.register_csv(tableref.0, table_path.to_str().unwrap(), options).await?;
+		df_ctx.register_parquet(
+			tableref.0,
+			table_path.to_str().unwrap(), options
+		).await?;
 	}	
 
 	let plan_bytes = std::fs::read(Path::new(&args.plan_path))?;

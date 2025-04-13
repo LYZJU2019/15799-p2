@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use datafusion::datasource::listing::{ListingTable, ListingTableConfig, ListingTableUrl};
 use datafusion::execution::options::ReadOptions;
-use datafusion::prelude::CsvReadOptions;
+use datafusion::prelude::{CsvReadOptions, ParquetReadOptions};
 use datafusion::execution::context::{SessionConfig, SessionContext};
 use datafusion_catalog::{MemorySchemaProvider, SchemaProvider, TableProvider};
 use datafusion_common::TableReference;
@@ -63,7 +63,7 @@ AND c_mktsegment = 'AUTOMOBILE'
 	let s_cfg = SampleConfig;
 
 	let b_cfg = BenchmarkConfig {
-		timeout: Some(std::time::Duration::from_secs(1)),
+		timeout: Some(std::time::Duration::from_secs(10)),
 		fast: false,
 	};
 
@@ -72,12 +72,16 @@ AND c_mktsegment = 'AUTOMOBILE'
 	let config = SessionConfig::default();
 	let df_ctx = SessionContext::new_with_config(config);
 	let schemas = tpch_schemas();
+	let mut table_paths = Vec::new();
 	for tableref in &schemas {
-		let options = CsvReadOptions::new().delimiter(b'|').quote(b'"')
-			.schema(&tableref.schema);
-		let path = format!("./tpch-data/{}.csv", tableref.name);
+		let options = ParquetReadOptions::new().schema(&tableref.schema);
+		let path = format!("./tpch-data/{}.parquet", tableref.name);
 		let table_path = std::path::Path::new(&path).canonicalize()?;
-		df_ctx.register_csv(tableref.name.clone(), table_path.to_str().unwrap(), options).await?;
+		table_paths.push((tableref.name.clone(), table_path.clone()));
+		df_ctx.register_parquet(
+			tableref.name.clone(),
+			table_path.to_str().unwrap(), options
+		).await?;
 	}	
 
 	let df = df_ctx.sql(&tpch_query_9).await?;
@@ -89,7 +93,8 @@ AND c_mktsegment = 'AUTOMOBILE'
 		plan,
 		backend: Arc::new(OptdOldBackend::new(
 			tables.clone(),
-			SampleStrategy::RuleBased(RuleBailStrategy::Threshold(1))
+			table_paths,
+			SampleStrategy::RuleBased(RuleBailStrategy::Threshold(10))
 		).await?),
 		state,
 		tables,

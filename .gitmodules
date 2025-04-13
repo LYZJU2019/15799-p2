@@ -16,6 +16,3 @@
 [submodule "optdbg/optd-original"]
 	path = optdbg/optd-original
 	url = git@github.com:quantumish/optd-original.git
-[submodule "integration-tests/tpch-data"]
-	path = integration-tests/tpch-data
-	url = https://github.com/aleaugustoplus/tpch-data.git

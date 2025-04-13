@@ -1,4 +1,5 @@
-use std::sync::Arc;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use async_recursion::async_recursion;
 use datafusion::arrow::datatypes::Schema;
@@ -7,6 +8,7 @@ use datafusion::datasource::MemTable;
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::execution::SessionState;
 use datafusion::logical_expr::LogicalPlan;
+use datafusion::parquet::arrow::arrow_reader::{ArrowReaderMetadata, ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::execution::context::SessionConfig;
 use dolomite::cascades::CascadesOptimizer as DolomiteCascadesOptimizer;
@@ -27,6 +29,10 @@ use optd_og_datafusion_repr::properties::column_ref::ColumnRefPropertyBuilder;
 use optd_og_datafusion_repr::properties::schema::SchemaPropertyBuilder;
 use optd_og_datafusion_repr::rules;
 use optd_og_datafusion_repr::DatafusionOptimizer;
+use optd_og_datafusion_repr_adv_cost::adv_stats::stats::DataFusionPerTableStats;
+use optd_og_datafusion_repr_adv_cost::adv_stats::stats::DataFusionBaseTableStats;
+use optd_og_datafusion_repr_adv_cost::new_physical_adv_cost;
+use rayon::prelude::*;
 
 use crate::common::Plan;
 
@@ -112,11 +118,114 @@ pub struct OptdOldBackend {
 	opt: Option<DatafusionOptimizer>,
 	/// Physical plan returned by get_best().
 	best: Option<Plan>,
+	stats: DataFusionBaseTableStats,
 }
+
+/// Taken from optd-perfbench (all credit to Alexis Schlomer).
+/// (not super easy to pull out of optd, so copy and paste :/)
+fn build_batch_reader(
+    tbl_fpath: PathBuf,
+    num_row_groups: usize,
+) -> impl FnOnce() -> Vec<ParquetRecordBatchReader> {
+    move || {
+        let groups: Vec<ParquetRecordBatchReader> = (0..num_row_groups)
+            .map(|group_num| {
+                let tbl_file = std::fs::File::open(tbl_fpath.clone())
+					.expect("Failed to open file");
+                let metadata =
+                    ArrowReaderMetadata::load(&tbl_file, Default::default()).unwrap();
+
+                ParquetRecordBatchReaderBuilder::new_with_metadata(
+                    tbl_file.try_clone().unwrap(),
+                    metadata.clone(),
+                )
+                    .with_row_groups(vec![group_num])
+                    .build()
+                    .unwrap()
+            })
+            .collect();
+
+        groups
+    }
+}
+
+/// Taken from optd-perfbench (all credit to Alexis Schlomer).
+/// (not super easy to pull out of optd, so copy and paste :/)
+fn gen_base_stats(tbl_paths: Vec<(String, PathBuf)>) -> anyhow::Result<DataFusionBaseTableStats> {
+    let base_table_stats = Mutex::new(DataFusionBaseTableStats::default());
+    let now = std::time::Instant::now();
+
+    tbl_paths.par_iter().for_each(|(tbl_name, tbl_fpath)| {
+        let start = std::time::Instant::now();
+
+        // We get the schema from the Parquet file, to ensure there's no divergence between
+        // the context and the file we are going to read.
+        // Further rounds of refactoring should adapt the entry point of stat gen.
+        let tbl_file = std::fs::File::open(tbl_fpath).expect("Failed to open file");
+        let parquet =
+            ParquetRecordBatchReaderBuilder::try_new(tbl_file.try_clone().unwrap()).unwrap();
+        let schema = parquet.schema();
+
+        let nb_cols = schema.fields().len();
+        let single_cols = (0..nb_cols).map(|v| vec![v]).collect::<Vec<_>>();
+
+        let stats_result = DataFusionPerTableStats::from_record_batches(
+            build_batch_reader(tbl_fpath.clone(), parquet.metadata().num_row_groups()),
+            build_batch_reader(tbl_fpath.clone(), parquet.metadata().num_row_groups()),
+            single_cols,
+            schema.clone(),
+        );
+
+        if let Ok(per_table_stats) = stats_result {
+            let mut stats = base_table_stats.lock().unwrap();
+            stats.insert(tbl_name.to_string(), per_table_stats);
+        }
+
+        println!(
+            "Table {:?} took in total {:?}...",
+            tbl_name,
+            start.elapsed()
+        );
+    });
+
+    println!("Total execution time {:?}...", now.elapsed());
+
+    let stats = base_table_stats.into_inner();
+    let l = stats.unwrap();
+    // Useful for debugging stats so I kept it
+    // l.iter().for_each(|(table_name, stats)| {
+    //     println!("Table: {} (num_rows: {})", table_name, stats.row_cnt);
+    //     stats
+    //         .column_comb_stats
+    //         .iter()
+    //         .sorted_by_key(|x| x.0[0])
+    //         .for_each(|x| {
+    //             let sum_freq: f64 = x.1.mcvs.frequencies().values().copied().sum();
+    //             println!(
+    //                 "Col: {} (n_distinct: {}) (n_frac: {}) (mcvs: {} {}) (tdigests: {:?} {:?}
+    // {:?} {:?} {:?})",                 x.0[0],
+    //                 x.1.ndistinct,
+    //                 x.1.null_frac,
+    //                 x.1.mcvs.frequencies().len(),
+    //                 sum_freq,
+    //                 x.1.distr.as_ref().map(|d| d.quantile(0.01)),
+    //                 x.1.distr.as_ref().map(|d| d.quantile(0.25)),
+    //                 x.1.distr.as_ref().map(|d| d.quantile(0.50)),
+    //                 x.1.distr.as_ref().map(|d| d.quantile(0.75)),
+    //                 x.1.distr.as_ref().map(|d| d.quantile(0.99)),
+    //             );
+    //         });
+    // });
+    // println!("{:#?}", stats);
+
+    Ok(l)
+}
+
 
 impl OptdOldBackend {
 	pub async fn new(
 		tables: Arc<dyn SchemaProvider>,
+		table_files: Vec<(String, PathBuf)>,
 		strat: SampleStrategy
 	) -> Result<Self> {
 		if strat == SampleStrategy::HintBased {
@@ -131,6 +240,8 @@ impl OptdOldBackend {
 		mem_prov.register_schema("public", tables)?;
 		let mem_prov_list = MemoryCatalogProviderList::new();
 		mem_prov_list.register_catalog("datafusion".to_string(), Arc::new(mem_prov));
+
+		let stats = gen_base_stats(table_files)?;
 		
 		let df_ctx = optd_og_datafusion_bridge::create_df_context(
 			Some(session_config.clone()),
@@ -138,41 +249,36 @@ impl OptdOldBackend {
 			Some(Arc::new(mem_prov_list)),
 			false,
 			false,
-			false,
-			None,
+			true,
+			Some(stats.clone()),
 		).await?;
 		Ok(Self {
 			df_ctx,
 			strat,
 			plan: None,
 			opt: None,
-			best: None
+			best: None,
+			stats,
 		})
 	}
 
 	#[async_recursion]
-	async fn get_est_cards(
-		node: Arc<DfPlanNode>,
+	async fn get_costs_and_cards(
+		node: GroupId,
 		opt: &DatafusionOptimizer,
+		costs: &mut Vec<f64>,
 		cards: &mut Vec<f64>,
-	) -> optd_og_core::cost::Statistics {
-		let mut children = Vec::new();
-		for i in node.children.iter().rev() {
-			let PlanNodeOrGroup::PlanNode(p) = i else {
-				panic!("shouldn't see group after optimization");
-			};
-			children.push(Self::get_est_cards(p.clone(), opt, cards).await);
+	) {
+		let winfo = opt.cascades_optimizer.memo.get_group_winner(node)
+			.as_full_winner().unwrap().clone();
+		
+		costs.push(winfo.total_cost.0[COMPUTE_COST]);
+		cards.push(winfo.statistics.0.downcast_ref::<DfStatistics>().unwrap().row_cnt);
+		
+		let expr = opt.cascades_optimizer.memo.get_expr_memoed(winfo.expr_id);
+		for child in &expr.children {
+			Self::get_costs_and_cards(*child, opt, costs, cards).await;
 		}
-		let children2: Vec<_> = (0..children.len()).rev().map(|x| &children[x]).collect();
-		let stats = opt.cascades_optimizer.cost.derive_statistics(
-			&node.typ, &node.predicates, children2.as_slice(),
-			RelNodeContext {
-				group_id: GroupId(0), expr_id: ExprId(0), children_group_ids: vec![]
-			},
-			&opt.cascades_optimizer,
-		);
-		cards.push(stats.0.downcast_ref::<DfStatistics>().unwrap().row_cnt);
-		stats
 	}
 
 	/// Implements rule-based sampling for optd-old backend.
@@ -219,35 +325,37 @@ impl OptdOldBackend {
 			// 		 .filter(|x| *x != "physical_conversion").collect::<Vec<_>>());
 			// optd will dump some info somewhere if budget is exhausted.
 			// NOTE: this blocks all println! calls! remember me when debugging!!
-			// let gag = gag::Gag::stdout().unwrap();
+			let gag = gag::Gag::stdout().unwrap();
 			// Avoid borrowing issue. Pretty hacky.
 			let mut opt_ctx = OptdPlanContext::new(st);
 			let plan = opt_ctx.conv_into_optd_og(&pl)?;
 			let plan = opt.heuristic_optimize(plan);
 
 			let catalog = Arc::new(DatafusionCatalog::new(self.df_ctx.catalog.clone()));
-			let optim = OptdCascadesOptimizer::new_with_options(
-                rs.clone().into_iter().cloned().collect::<Vec<_>>(),
-                Box::new(AdaptiveCostModel::new(50)),
-                vec![
-                    Box::new(SchemaPropertyBuilder::new(catalog.clone()))
-                        as Box<dyn LogicalPropertyBuilderAny<DfNodeType>>,
-                    Box::new(ColumnRefPropertyBuilder::new(catalog.clone()))
-                        as Box<dyn LogicalPropertyBuilderAny<DfNodeType>>,
-                ]
-                .into(),
-                OptimizerProperties {
-                    panic_on_budget: false,
-                    partial_explore_iter: Some(1 << 18),
-                    partial_explore_space: Some(1 << 14),
-                    disable_pruning: false,
-                    enable_tracing: false,
-                },
-            );
 
-			opt.cascades_optimizer = optim;
+			let mut opt = new_physical_adv_cost(catalog, self.stats.clone(), false);
+			
+			// let opt = OptdCascadesOptimizer::new_with_options(
+            //     rs.clone().into_iter().cloned().collect::<Vec<_>>(),
+            //     Box::new(AdaptiveCostModel::new(50)),
+            //     vec![
+            //         Box::new(SchemaPropertyBuilder::new(catalog.clone()))
+            //             as Box<dyn LogicalPropertyBuilderAny<DfNodeType>>,
+            //         Box::new(ColumnRefPropertyBuilder::new(catalog.clone()))
+            //             as Box<dyn LogicalPropertyBuilderAny<DfNodeType>>,
+            //     ]
+            //     .into(),
+            //     OptimizerProperties {
+            //         panic_on_budget: false,
+            //         partial_explore_iter: Some(1 << 18),
+            //         partial_explore_space: Some(1 << 14),
+            //         disable_pruning: false,
+            //         enable_tracing: false,
+            //     },
+            // );
 
-				
+			// opt.cascades_optimizer = optim;
+
 			opt.cascades_optimizer.rules = Arc::from(
 				rs.into_iter().cloned().collect::<Vec<_>>().into_boxed_slice()
 			);
@@ -255,18 +363,15 @@ impl OptdOldBackend {
 			let (gid, opt_plan, meta) = opt.cascades_optimize(plan.clone())?;
 
 			let mut cards = Vec::new();
-			Self::get_est_cards(opt_plan.clone(), &opt, &mut cards).await;
-			cards.reverse();
+			let mut costs = Vec::new();
+			Self::get_costs_and_cards(gid, &opt, &mut costs, &mut cards).await;
 			
-			let winfo = opt.cascades_optimizer.memo.get_group_winner(gid)
-				.as_full_winner().unwrap().clone();
 			opt_ctx.optimizer = Some(&opt);
 
 			let phys_plan = opt_ctx.conv_from_optd_og(opt_plan, meta).await?;
-			let cost = winfo.total_cost.0[COMPUTE_COST];
-			let phys_plan = Plan::new(phys_plan, cost, cards);			
+			let phys_plan = Plan::new(phys_plan, costs, cards);			
 
-			// drop(gag);
+			drop(gag);
 			if !out.contains(&phys_plan) && *self.best.as_ref().unwrap() != phys_plan {
 				println!("{}", phys_plan);
 				out.push(phys_plan);
@@ -290,18 +395,17 @@ impl Sampler for OptdOldBackend {
 		let plan = opt_ctx.conv_into_optd_og(&pl)?;
 		let plan = opt.heuristic_optimize(plan);
 		let (gid, plan, meta) = opt.cascades_optimize(plan)?;
-		let winfo = opt.cascades_optimizer.memo.get_group_winner(gid)
-			.as_full_winner().unwrap().clone();
+
 		let mut cards = Vec::new();
-		Self::get_est_cards(plan.clone(), &opt, &mut cards).await;
-		cards.reverse();
+		let mut costs = Vec::new();
+		Self::get_costs_and_cards(gid, &opt, &mut costs, &mut cards).await;
 		
 		opt_ctx.optimizer = Some(&opt);
+		println!("got output\n{plan}");
 		let phys_plan = opt_ctx.conv_from_optd_og(plan, meta).await?;
-		let cost = winfo.total_cost.0[COMPUTE_COST];
 		self.plan = Some(pl);
 		self.opt = Some(*opt);
-		let out = Plan::new(phys_plan, cost, cards);
+		let out = Plan::new(phys_plan, costs, cards);
 		self.best = Some(out.clone());
 		println!("best is\n{out}");
 		Ok(out)
@@ -353,7 +457,7 @@ impl Sampler for DolomiteBackend {
 			.unwrap().winner(&opt.required_prop)
 			.unwrap().lowest_cost.0;
 		self.opt = Some(opt);
-		let out = Plan::new(phys_plan, cost, vec![]);
+		let out = Plan::new(phys_plan, vec![cost], vec![0.0]);
 		println!("best is\n{out}");
 		Ok(out)
 	}

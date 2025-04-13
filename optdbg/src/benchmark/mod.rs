@@ -137,16 +137,16 @@ async fn measure_plan(
 	let mut cardinalities = Vec::new();
 	let mut runtimes = Vec::new();
 	// FIXME temporary hack to get around OOMs
-	if plan.est_cost < 1000000000.0 {
+	if plan.est_costs[0] < 1000000000.0 {
 		measure_subplan(plan.tree.clone(), ctx, cfg, &mut cardinalities, &mut runtimes).await?;
 	} else {
 		cardinalities.push(Err(MeasureError::OOM));
 		runtimes.push(Err(MeasureError::OOM));
 	}
 	if let Ok(runtime) = runtimes[0] {
-		println!("ran plan in {}ms (est cost {})", runtime.as_millis(), plan.est_cost);
+		println!("ran plan in {}ms (est cost {})", runtime.as_millis(), plan.est_costs[0]);
 	} else {
-		println!("plan timed out (est cost {})", plan.est_cost);
+		println!("plan timed out (est cost {})", plan.est_costs[0]);
 	}
 	Ok(MeasuredPlan {
 		plan,
@@ -193,6 +193,7 @@ async fn measure_plan_ipc(
 	
 	if !output.success() {
 		let size = plan.size();
+		println!("died");
 		Ok(MeasuredPlan {
 			plan,
 			runtime: Err(MeasureError::OOM),
@@ -215,7 +216,7 @@ pub async fn benchmark(
 	// warmup time affecting measurements or something like that...
 	let best = measure_plan_ipc(sample.best_plan, ctx.clone(), &cfg, sample.tables.clone()).await?;
 	for plan in sample.alternates.into_iter()
-		.sorted_by(|x, y| x.est_cost.partial_cmp(&y.est_cost).unwrap()) {
+		.sorted_by(|x, y| x.est_costs[0].partial_cmp(&y.est_costs[0]).unwrap()) {
 		out.push(measure_plan_ipc(plan, ctx.clone(), &cfg, sample.tables.clone()).await?);
 	}
 	out.sort_by(|x, y| {
