@@ -7,26 +7,21 @@ use std::sync::Arc;
 use std::time::{Instant, Duration};
 
 use datafusion::arrow::datatypes::Schema;
-use datafusion::catalog::TableProvider;
-use datafusion::datasource::listing::{ListingTable, ListingTableConfig, ListingTableUrl};
-use datafusion::execution::options::ReadOptions;
 use datafusion::prelude::{CsvReadOptions, SessionContext};
-use datafusion::sql::TableReference;
 use datafusion_proto::bytes::physical_plan_from_bytes;
 use optdbg::benchmark::BenchmarkConfig;
 
-use anyhow::Result;
 use async_recursion::async_recursion;
 use clap::Parser;
 use datafusion::arrow::array::RecordBatch;
 use datafusion::{execution::TaskContext, physical_plan::{collect, ExecutionPlan}};
-use optdbg::common::PlanMeasurements;
+use optdbg::common::{MeasureError, PlanMeasurements};
 
 async fn time_subplan(
 	node: Arc<dyn ExecutionPlan>,
 	ctx: Arc<TaskContext>,
 	timeout: Option<Duration>,
-) -> Result<Option<(Vec<RecordBatch>, Duration)>> {
+) -> anyhow::Result<Option<(Vec<RecordBatch>, Duration)>> {
 	let (result_tx, result_rx) = tokio::sync::oneshot::channel();
 	let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
 	if let Some(timeout) = timeout {
@@ -72,15 +67,15 @@ async fn measure_subplan(
 	node: Arc<dyn ExecutionPlan>,
 	ctx: Arc<TaskContext>,
 	cfg: &BenchmarkConfig,
-	cards: &mut Vec<Option<usize>>,
-	times: &mut Vec<Option<Duration>>,
-) -> Result<()> {
+	cards: &mut Vec<Result<usize, MeasureError>>,
+	times: &mut Vec<Result<Duration, MeasureError>>,
+) -> anyhow::Result<()> {
 	if let Some((batches, time)) = time_subplan(node.clone(), ctx.clone(), cfg.timeout).await? {
-		cards.push(Some(batches.iter().map(|x| x.num_rows()).sum()));
-		times.push(Some(time));
+		cards.push(Ok(batches.iter().map(|x| x.num_rows()).sum()));
+		times.push(Ok(time));
 	} else {
-		cards.push(None);
-		times.push(None);
+		cards.push(Err(MeasureError::Timeout));
+		times.push(Err(MeasureError::Timeout));
 	}
 	for child in node.children() {
 		measure_subplan(child.clone(), ctx.clone(), cfg, cards, times).await?;
@@ -136,7 +131,7 @@ async fn main() -> anyhow::Result<()> {
 	let mut cards = Vec::new();
 	let mut times = Vec::new();
 	measure_subplan(plan, df_ctx.task_ctx(), &cfg, &mut cards, &mut times).await?;
-	if let Some(time) = times[0] {
+	if let Ok(time) = times[0] {
 		println!("got time {}ms", time.as_millis());
 	} else {
 		println!("timed out!");

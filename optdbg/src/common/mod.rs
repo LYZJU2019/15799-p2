@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use datafusion::physical_plan::ExecutionPlan;
+use thiserror::Error;
 use serde::{Deserialize, Serialize};
 
 // TODO find a way to compare plan properties?
@@ -76,9 +77,17 @@ impl std::fmt::Display for Plan {
 	}
 }
 
+#[derive(Clone, Copy, Error, Debug, PartialEq, Serialize, Deserialize)]
+pub enum MeasureError {
+	#[error("exhausted memory")]
+	OOM,
+	#[error("timed out")]
+	Timeout,
+}
+
 /// Wrapper type for easier IPC. See `MeasuredPlan`.
 #[derive(Serialize, Deserialize)]
 pub struct PlanMeasurements {
-	pub cardinalities: Vec<Option<usize>>,	
-	pub sub_runtimes: Option<Vec<Option<Duration>>>,
+	pub cardinalities: Vec<Result<usize, MeasureError>>,	
+	pub sub_runtimes: Option<Vec<Result<Duration, MeasureError>>>,
 }

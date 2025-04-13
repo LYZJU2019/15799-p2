@@ -3,10 +3,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use datafusion::arrow::array::RecordBatch;
-use datafusion::arrow::datatypes::Schema;
 use datafusion::catalog::SchemaProvider;
 use datafusion::execution::TaskContext;
-use anyhow::Result;
 use datafusion::physical_plan::{collect, ExecutionPlan};
 use datafusion_proto::bytes::physical_plan_to_bytes;
 use itertools::Itertools;
@@ -14,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use async_recursion::async_recursion;
 
 use crate::sampling::SampleOutput;
-use crate::common::{Plan, PlanMeasurements};
+use crate::common::{Plan, PlanMeasurements, MeasureError};
 
 #[derive(Serialize, Deserialize)]
 pub struct BenchmarkConfig {
@@ -38,15 +36,11 @@ pub struct BenchmarkOutput {
 pub struct MeasuredPlan {
 	pub plan: Plan,
 	/// Time it took to run the overall plan. None if timeout hit.
-	pub runtime: Option<Duration>,
+	pub runtime: Result<Duration, MeasureError>,
 	/// Preorder array of each subplan's true cardinality.
-	pub cardinalities: Vec<Option<usize>>,
+	pub cardinalities: Vec<Result<usize, MeasureError>>,
 	/// Preorder array of each subplan's runtime.
-	///
-	/// Outer `Option` semantically means "we may not have ran this query" whereas
-	/// inner `Option`s semantically mean "we ran query and it timed out / died".
-	// TODO distinguish OOM vs death?
-	pub sub_runtimes: Option<Vec<Option<Duration>>>,
+	pub sub_runtimes: Option<Vec<Result<Duration, MeasureError>>>,
 }
 
 impl MeasuredPlan {
@@ -56,7 +50,8 @@ impl MeasuredPlan {
 	) -> Self {
 		Self {
 			plan,
-			runtime: measurements.sub_runtimes.as_ref().map(|x| x[0]).flatten(),
+			// FIXME need to change this when implementing covering queries!
+			runtime: measurements.sub_runtimes.as_ref().unwrap()[0].clone(),
 			cardinalities: measurements.cardinalities,
 			sub_runtimes: measurements.sub_runtimes
 		}
@@ -68,7 +63,7 @@ async fn time_subplan(
 	node: Arc<dyn ExecutionPlan>,
 	ctx: Arc<TaskContext>,
 	timeout: Option<Duration>,
-) -> Result<Option<(Vec<RecordBatch>, Duration)>> {
+) -> anyhow::Result<Option<(Vec<RecordBatch>, Duration)>> {
 	let (result_tx, result_rx) = tokio::sync::oneshot::channel();
 	let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
 	if let Some(timeout) = timeout {
@@ -114,15 +109,15 @@ async fn measure_subplan(
 	node: Arc<dyn ExecutionPlan>,
 	ctx: Arc<TaskContext>,
 	cfg: &BenchmarkConfig,
-	cards: &mut Vec<Option<usize>>,
-	times: &mut Vec<Option<Duration>>,
-) -> Result<()> {
+	cards: &mut Vec<Result<usize, MeasureError>>,
+	times: &mut Vec<Result<Duration, MeasureError>>,
+) -> anyhow::Result<()> {
 	if let Some((batches, time)) = time_subplan(node.clone(), ctx.clone(), cfg.timeout).await? {
-		cards.push(Some(batches.iter().map(|x| x.num_rows()).sum()));
-		times.push(Some(time));
+		cards.push(Ok(batches.iter().map(|x| x.num_rows()).sum()));
+		times.push(Ok(time));
 	} else {
-		cards.push(None);
-		times.push(None);
+		cards.push(Err(MeasureError::Timeout));
+		times.push(Err(MeasureError::Timeout));
 	}
 	for child in node.children() {
 		measure_subplan(child.clone(), ctx.clone(), cfg, cards, times).await?;
@@ -138,17 +133,17 @@ async fn measure_plan(
 	plan: Plan,
 	ctx: Arc<TaskContext>,
 	cfg: &BenchmarkConfig,
-) -> Result<MeasuredPlan> {
+) -> anyhow::Result<MeasuredPlan> {
 	let mut cardinalities = Vec::new();
 	let mut runtimes = Vec::new();
 	// FIXME temporary hack to get around OOMs
 	if plan.est_cost < 1000000000.0 {
 		measure_subplan(plan.tree.clone(), ctx, cfg, &mut cardinalities, &mut runtimes).await?;
 	} else {
-		cardinalities.push(None);
-		runtimes.push(None);
+		cardinalities.push(Err(MeasureError::OOM));
+		runtimes.push(Err(MeasureError::OOM));
 	}
-	if let Some(runtime) = runtimes[0] {
+	if let Ok(runtime) = runtimes[0] {
 		println!("ran plan in {}ms (est cost {})", runtime.as_millis(), plan.est_cost);
 	} else {
 		println!("plan timed out (est cost {})", plan.est_cost);
@@ -169,7 +164,7 @@ async fn measure_plan_ipc(
 	ctx: Arc<TaskContext>,
 	cfg: &BenchmarkConfig,
 	tables: Arc<dyn SchemaProvider>,
-) -> Result<MeasuredPlan> {
+) -> anyhow::Result<MeasuredPlan> {
 	let bytes = physical_plan_to_bytes(plan.clone().tree)?;
 	let mut plan_file = tempfile::NamedTempFile::new()?;
 	plan_file.write_all(&bytes)?;
@@ -200,9 +195,9 @@ async fn measure_plan_ipc(
 		let size = plan.size();
 		Ok(MeasuredPlan {
 			plan,
-			runtime: None,
-			cardinalities: vec![None; size],
-			sub_runtimes: Some(vec![None; size]),
+			runtime: Err(MeasureError::OOM),
+			cardinalities: vec![Err(MeasureError::OOM); size],
+			sub_runtimes: Some(vec![Err(MeasureError::OOM); size]),
 		})
 	} else {
 		let measurements: PlanMeasurements = serde_json::from_reader(out_file)?;
@@ -210,7 +205,10 @@ async fn measure_plan_ipc(
 	}
 }
 
-pub async fn benchmark(sample: SampleOutput, cfg: BenchmarkConfig) -> Result<BenchmarkOutput> {
+pub async fn benchmark(
+	sample: SampleOutput,
+	cfg: BenchmarkConfig
+) -> anyhow::Result<BenchmarkOutput> {
 	let ctx = sample.session.task_ctx();
 	let mut out = Vec::new();
 	// TODO best measurement should definitely be interleaved in to avoid
@@ -220,9 +218,19 @@ pub async fn benchmark(sample: SampleOutput, cfg: BenchmarkConfig) -> Result<Ben
 		.sorted_by(|x, y| x.est_cost.partial_cmp(&y.est_cost).unwrap()) {
 		out.push(measure_plan_ipc(plan, ctx.clone(), &cfg, sample.tables.clone()).await?);
 	}
-	out.sort_by(|x, y| x.runtime.cmp(&y.runtime));
+	out.sort_by(|x, y| {
+		if x.runtime.is_err() {
+			std::cmp::Ordering::Greater
+		} else if y.runtime.is_err() {
+			std::cmp::Ordering::Less
+		} else {
+			x.runtime.unwrap().cmp(&y.runtime.unwrap())
+		}
+	});
 	let chosen_idx = out.iter()
-		.position(|x| x.runtime > best.runtime).unwrap_or(out.len());
+		.position(|x| x.runtime.is_err() ||
+				  !best.runtime.is_err() && x.runtime.unwrap() > best.runtime.unwrap())
+		.unwrap_or(out.len());
 	out.insert(chosen_idx, best);
 	
 	// TODO actually measure metrics
