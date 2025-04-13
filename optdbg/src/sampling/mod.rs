@@ -1,8 +1,10 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use async_recursion::async_recursion;
 use datafusion::catalog::{CatalogProvider, CatalogProviderList, MemoryCatalogProvider, MemoryCatalogProviderList, SchemaProvider};
+use datafusion::common::HashSet;
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::execution::SessionState;
 use datafusion::logical_expr::LogicalPlan;
@@ -13,13 +15,15 @@ use dolomite::optimizer::Optimizer;
 use datafusion_dolomite_integration::conversion as dolomite_conversion;
 use anyhow::Result;
 use itertools::Itertools;
-use optd_og_core::cascades::GroupId;
+use optd_og_core::cascades::{ExprId, GroupId};
+use optd_og_core::cost::Cost;
+use optd_og_core::nodes::{PlanNodeMeta, PlanNodeMetaMap, PlanNodeOrGroup};
 use optd_og_datafusion_bridge::{DatafusionCatalog, OptdDfContext, OptdPlanContext};
 use optd_og_core::{rules::Rule, cascades::{CascadesOptimizer as OptdCascadesOptimizer, Memo}};
 use optd_og_datafusion_repr::cost::base_cost::DfStatistics;
 use optd_og_datafusion_repr::cost::COMPUTE_COST;
 use async_trait::async_trait;
-use optd_og_datafusion_repr::plan_nodes::DfNodeType;
+use optd_og_datafusion_repr::plan_nodes::{ArcDfPlanNode, DfNodeType, DfPlanNode};
 use optd_og_datafusion_repr::rules;
 use optd_og_datafusion_repr::DatafusionOptimizer;
 use optd_og_datafusion_repr_adv_cost::adv_stats::stats::DataFusionPerTableStats;
@@ -111,6 +115,7 @@ pub struct OptdOldBackend {
 	opt: Option<DatafusionOptimizer>,
 	/// Physical plan returned by get_best().
 	best: Option<Plan>,
+	best_cascades: Option<(GroupId, ArcDfPlanNode, PlanNodeMetaMap)>,
 	stats: Option<DataFusionBaseTableStats>,
 }
 
@@ -229,6 +234,7 @@ impl OptdOldBackend {
 			plan: None,
 			opt: None,
 			best: None,
+			best_cascades: None,
 			stats,
 		})
 	}
@@ -252,6 +258,89 @@ impl OptdOldBackend {
 		}
 	}
 
+	fn get_alts_help(
+		opt: &DatafusionOptimizer, gid: GroupId,
+		visited: &mut HashSet<ExprId>, fake_meta: &mut PlanNodeMetaMap
+	) -> Vec<ArcDfPlanNode> {
+		let mut out = Vec::new();
+		let exprs = &opt.cascades_optimizer.memo.get_group(gid).group_exprs;
+		// println!("Processing group {gid} with {exprs:?}");
+		for expr_id in exprs {
+			if visited.contains(expr_id) {
+				continue;
+			}
+			visited.insert(*expr_id);
+			let expr = opt.cascades_optimizer.memo.get_expr_memoed(*expr_id);
+			if !matches!(expr.typ,
+				DfNodeType::PhysicalAgg | DfNodeType::PhysicalEmptyRelation
+					| DfNodeType::PhysicalProjection | DfNodeType::PhysicalScan
+					| DfNodeType::PhysicalFilter | DfNodeType::PhysicalSort
+					| DfNodeType::PhysicalNestedLoopJoin(_) | DfNodeType::PhysicalHashJoin(_)
+						 | DfNodeType::PhysicalLimit
+			) {
+				continue;
+			}
+			let mut children: Vec<Vec<ArcDfPlanNode>> = Vec::with_capacity(expr.children.len());
+			for child in &expr.children {
+				// println!("Expr w/ id {expr_id} (aka {}) is has child in group {child}", expr.typ)
+				children.push(Self::get_alts_help(opt, *child, visited, fake_meta));
+			}
+			
+			if children.is_empty() {
+				out.push(Arc::new(optd_og_core::nodes::PlanNode {
+					typ: expr.typ.clone(),
+					children: vec![],
+					predicates: expr.predicates.iter()
+						.map(|x| opt.cascades_optimizer.memo.get_pred(*x)).collect(),
+				}));
+			} else {
+				let iter = children.iter().multi_cartesian_product();
+				for children in iter {
+					let children = children.into_iter()
+						.map(|x| PlanNodeOrGroup::PlanNode(x.clone())).collect();
+					let thing = Arc::new(optd_og_core::nodes::PlanNode {
+						typ: expr.typ.clone(),
+						children,
+						predicates: expr.predicates.iter()
+							.map(|x| opt.cascades_optimizer.memo.get_pred(*x)).collect(),
+					});
+					fake_meta.insert(thing.as_ref() as *const _ as usize,
+									 PlanNodeMeta {
+										 group_id: gid,
+										 weighted_cost: 0.0,
+										 cost: Cost(vec![]),
+										 stat: Arc::new(optd_og_core::cost::Statistics(
+											 Box::new(DfStatistics { row_cnt: 0.0 })
+										 )),
+										 cost_display: "".to_string(),
+										 stat_display: "".to_string(),
+									 });
+					out.push(thing.clone());
+				}
+			}
+		}
+		out
+	}
+	
+	async fn get_alts_memo(&mut self, st: &SessionState) -> Result<Vec<Plan>> {
+		let opt = self.opt.as_ref().unwrap();
+		let (gid, _, _) = self.best_cascades.take().unwrap();
+		let mut set = HashSet::new();
+		let mut fake_meta = HashMap::new();
+		let plans = Self::get_alts_help(opt, gid, &mut set, &mut fake_meta);
+		println!("Found {} alternates", plans.len());
+		let mut opt_ctx = OptdPlanContext::new(st);
+		opt_ctx.conv_into_optd_og(&self.plan.clone().unwrap())?;
+		opt_ctx.optimizer = Some(&opt);
+		let mut out = Vec::new();
+		for plan in plans {
+			println!("{plan}");
+			let phys_plan = opt_ctx.conv_from_optd_og(plan, fake_meta.clone()).await?;
+			out.push(Plan::new(phys_plan, vec![], vec![]))
+		}
+		Ok(out)
+	}
+	
 	/// Implements rule-based sampling for optd-old backend.
 	// TODO Be a lot smarter about this: can pre-filter rules for applicability,
 	// can sort rules in the thresholding case, can hash trees for speedier equality checks,
@@ -351,8 +440,9 @@ impl Sampler for OptdOldBackend {
 		let mut opt_ctx = OptdPlanContext::new(st);
 		let plan = opt_ctx.conv_into_optd_og(&pl)?;
 		let plan = opt.heuristic_optimize(plan);
-		let (gid, plan, meta) = opt.cascades_optimize(plan)?;
-
+		let out = opt.cascades_optimize(plan)?;
+		self.best_cascades = Some(out.clone());
+		let (gid, plan, meta) = out;
 		let mut cards = Vec::new();
 		let mut costs = Vec::new();
 		Self::get_costs_and_cards(gid, &opt, &mut costs, &mut cards).await;
@@ -363,6 +453,9 @@ impl Sampler for OptdOldBackend {
 		self.opt = Some(*opt);
 		let out = Plan::new(phys_plan, costs, cards);
 		self.best = Some(out.clone());
+
+		
+		
 		println!("best is\n{out}");
 		Ok(out)
 	}
@@ -370,7 +463,7 @@ impl Sampler for OptdOldBackend {
 	async fn get_alternates(&mut self, st: &SessionState) -> Result<Vec<Plan>> {
 		match &self.strat {
 			SampleStrategy::RuleBased(t) => self.get_alts_rule(st, *t).await,
-			SampleStrategy::MemoBased => todo!(),
+			SampleStrategy::MemoBased => self.get_alts_memo(st).await,
 			_ => unreachable!()
 		}
 	}
