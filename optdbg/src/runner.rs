@@ -122,6 +122,7 @@ async fn main() -> anyhow::Result<()> {
 	let schemas: Vec<(String, Schema)> = serde_json::from_slice(&schema_bytes)?;
 	
 	let df_ctx = SessionContext::new();
+	// TODO TODO this is hardcoded very sad :( 
 	for tableref in schemas {
 		let options = CsvReadOptions::new().delimiter(b'|').quote(b'"')
 			.schema(&tableref.1);

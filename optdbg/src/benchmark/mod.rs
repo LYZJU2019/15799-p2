@@ -42,8 +42,9 @@ pub struct MeasuredPlan {
 	/// Preorder array of each subplan's true cardinality.
 	pub cardinalities: Vec<Option<usize>>,
 	/// Preorder array of each subplan's runtime.
-	// outer Option semantically means "we may not have ran this query"
-	// inner Options semantically mean "we ran query and it timed out / died"
+	///
+	/// Outer `Option` semantically means "we may not have ran this query" whereas
+	/// inner `Option`s semantically mean "we ran query and it timed out / died".
 	// TODO distinguish OOM vs death?
 	pub sub_runtimes: Option<Vec<Option<Duration>>>,
 }
@@ -62,6 +63,7 @@ impl MeasuredPlan {
 	}
 }
 
+/// Times a subplan's execution, giving up after a timeout.
 async fn time_subplan(
 	node: Arc<dyn ExecutionPlan>,
 	ctx: Arc<TaskContext>,
@@ -129,6 +131,9 @@ async fn measure_subplan(
 }
 
 /// Measure cardinalities and runtimes of plan and subplans.
+///
+/// Use `measure_ipc` for OOM safety (which is a real concern).
+// TODO think of a more consistent hack? do we bother keeping this at all?
 async fn measure_plan(
 	plan: Plan,
 	ctx: Arc<TaskContext>,
@@ -221,7 +226,6 @@ pub async fn benchmark(sample: SampleOutput, cfg: BenchmarkConfig) -> Result<Ben
 	out.insert(chosen_idx, best);
 	
 	// TODO actually measure metrics
-	
 	Ok(BenchmarkOutput {
 		plans: out,
 		chosen_idx,

@@ -5,6 +5,7 @@ use datafusion::physical_plan::ExecutionPlan;
 use serde::{Deserialize, Serialize};
 
 // TODO find a way to compare plan properties?
+/// Returns true if two plans have same structure.
 fn eq_plans(a: Arc<dyn ExecutionPlan>, b: Arc<dyn ExecutionPlan>) -> bool {
 	if a.name() != b.name() {
 		return false;
@@ -22,10 +23,12 @@ fn eq_plans(a: Arc<dyn ExecutionPlan>, b: Arc<dyn ExecutionPlan>) -> bool {
 	return true;
 }
 
+/// Returns the number of nodes in a plan.
 fn plan_size(a: Arc<dyn ExecutionPlan>) -> usize {
 	1 + a.children().into_iter().cloned().map(plan_size).sum::<usize>()
 }
 
+/// Displays the name of each node in a plan with tree-style indentation.
 fn format_plan(
 	f: &mut std::fmt::Formatter<'_>,
 	plan: Arc<dyn ExecutionPlan>,
@@ -41,6 +44,7 @@ fn format_plan(
 	Ok(())
 }
 
+/// Main wrapper type of a physical plan alongside estimated cost.
 #[derive(Clone)]
 pub struct Plan {
 	pub tree: Arc<dyn ExecutionPlan>,
@@ -52,6 +56,7 @@ impl Plan {
 		Self { tree, est_cost } 
 	}
 
+	/// Get the number of nodes in a pln.
 	pub fn size(&self) -> usize {
 		plan_size(self.tree.clone())
 	}
@@ -71,8 +76,9 @@ impl std::fmt::Display for Plan {
 	}
 }
 
+/// Wrapper type for easier IPC. See `MeasuredPlan`.
 #[derive(Serialize, Deserialize)]
 pub struct PlanMeasurements {
-	pub cardinalities: Vec<Option<usize>>,
+	pub cardinalities: Vec<Option<usize>>,	
 	pub sub_runtimes: Option<Vec<Option<Duration>>>,
 }
