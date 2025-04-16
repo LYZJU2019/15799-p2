@@ -21,7 +21,12 @@ pub struct BenchmarkConfig {
 }
 
 // placeholder type
-pub struct OptimizerMetrics;
+pub struct OptimizerMetrics {
+	/// Raw TAQO score 's' (lower is better)
+	pub taqo_score_s: f64,
+	/// TAQO accuracy converted to percentage (0-100, higher is better)
+	pub taqo_accuracy_percent: f64,
+}
 
 pub struct BenchmarkOutput {
 	/// Sorted by runtime (fastest at front).
@@ -234,10 +239,123 @@ pub async fn benchmark(
 		.unwrap_or(out.len());
 	out.insert(chosen_idx, best);
 	
-	// TODO actually measure metrics
+	// Calculate cost rank accuracy
+	let (taqo_s, taqo_percent) = calculate_cost_rank_accuracy(&out);
+	
 	Ok(BenchmarkOutput {
 		plans: out,
 		chosen_idx,
-		metrics: OptimizerMetrics
+		metrics: OptimizerMetrics {
+			taqo_score_s: taqo_s,
+			taqo_accuracy_percent: taqo_percent,
+		}
 	})
+}
+
+/// Calculates the accuracy of cost estimation using TAQO's weighted Kendall's Tau coefficient
+/// Returns the raw score 's' and a derived percentage accuracy (0-100, higher is better).
+fn calculate_cost_rank_accuracy(plans: &[MeasuredPlan]) -> (f64, f64) {
+	// Create a vector of (actual_runtime, estimated_cost) pairs
+	let mut runtime_cost_pairs: Vec<(Duration, f64)> = Vec::new();
+	
+	// Print detailed plan information
+	println!("\nDetailed plan information:");
+	println!("{:<8} {:<15} {:<20} {:<15}", "Plan #", "Runtime (ms)", "Estimated Cost", "Status");
+	println!("{:-<60}", "");
+	
+	for (i, plan) in plans.iter().enumerate() {
+		let runtime = match plan.runtime {
+			Ok(duration) => format!("{:.2}", duration.as_secs_f64() * 1000.0),
+			Err(_) => "Error".to_string(),
+		};
+		let status = if plan.runtime.is_ok() { "Valid" } else { "Invalid" };
+		println!("{:<8} {:<15} {:<20.2} {:<15}", 
+			i, runtime, plan.plan.est_costs[0], status);
+	}
+	println!("{:-<60}\n", "");
+	
+	// Collect valid measurements
+	for plan in plans {
+		if let Ok(runtime) = plan.runtime {
+			runtime_cost_pairs.push((runtime, plan.plan.est_costs[0]));
+		}
+	}
+	
+	println!("Number of valid plans: {}", runtime_cost_pairs.len());
+	
+	// Find the best actual runtime for weight calculation (a1 in the paper)
+	let best_runtime = runtime_cost_pairs.iter()
+		.map(|(r, _)| *r)
+		.min()
+		.unwrap();
+	
+	// Find min and max values for normalization (a_n, a_1, max(e_k), min(e_k))
+	let min_r = best_runtime.as_secs_f64(); // a1
+	let max_r = runtime_cost_pairs.iter()
+		.map(|(r, _)| r.as_secs_f64())
+		.max_by(|a, b| a.partial_cmp(b).unwrap()) // a_n
+		.unwrap();
+	let min_e = runtime_cost_pairs.iter()
+		.map(|(_, e)| *e)
+		.min_by(|a, b| a.partial_cmp(b).unwrap())
+		.unwrap();
+	let max_e = runtime_cost_pairs.iter()
+		.map(|(_, e)| *e)
+		.max_by(|a, b| a.partial_cmp(b).unwrap())
+		.unwrap();
+	
+	// Avoid division by zero if all runtimes or costs are identical
+	let range_r = max_r - min_r;
+	let range_e = max_e - min_e;
+	
+	// Calculate weighted Kendall's Tau score 's' (Equation 4)
+	let mut s = 0.0;
+	let n = runtime_cost_pairs.len();
+	
+	for i in 0..n {
+		for j in (i+1)..n {
+			let (r_i_dur, e_i) = runtime_cost_pairs[i];
+			let (r_j_dur, e_j) = runtime_cost_pairs[j];
+			
+			// Skip pairs with identical estimated costs (sgn(0) is undefined/ignored)
+			if e_i == e_j {
+				continue;
+			}
+
+			let r_i = r_i_dur.as_secs_f64(); // a_i
+			let r_j = r_j_dur.as_secs_f64(); // a_j
+			
+			// Calculate weights (Equation 2, w_m = a1 / am)
+			let w_i = if r_i > 0.0 { min_r / r_i } else { 0.0 }; 
+			let w_j = if r_j > 0.0 { min_r / r_j } else { 0.0 };
+			
+			// Calculate normalized Euclidean distance (Equation 3)
+			let term1 = if range_r > 0.0 { ((r_j - r_i) / range_r).powi(2) } else { 0.0 };
+			let term2 = if range_e > 0.0 { ((e_j - e_i) / range_e).powi(2) } else { 0.0 };
+			let d_ij = (term1 + term2).sqrt();
+			
+			// Calculate sign based *only* on estimated costs (sgn(ej - ei))
+			let sign = (e_j - e_i).signum(); // Returns 1.0 or -1.0 since e_i != e_j
+			
+			let term = w_i * w_j * d_ij;
+			
+			// Add to sum (Equation 4)
+			s += term * sign;
+		}
+	}
+	
+
+	// Calculate percentage accuracy (0-100, higher is better)
+	// Using exponential decay function: 100 * exp(-|s|)
+	// This creates a curve where:
+	// - s = 0 gives 100% accuracy (perfect correlation)
+	// - As |s| increases, accuracy exponentially decreases
+	// - For very large |s|, accuracy approaches 0%
+	let accuracy_percent = 100.0 * (-s.abs()).exp();
+
+	println!("TAQO Score (s): {:.4} (lower is better)", s);
+	println!("TAQO Accuracy: {:.2}% (higher is better)", accuracy_percent);
+	
+	// Return the raw score 's' and the percentage accuracy
+	(s, accuracy_percent)
 }
