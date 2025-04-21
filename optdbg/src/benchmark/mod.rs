@@ -26,6 +26,12 @@ pub struct OptimizerMetrics {
 	pub taqo_score_s: f64,
 	/// TAQO accuracy converted to percentage (0-100, higher is better)
 	pub taqo_accuracy_percent: f64,
+	/// Performance Factor (PF) - percentage of plans that perform worse than or equal to the optimizer-chosen plan
+	pub performance_factor: f64,
+	/// Average Q-Error for cardinality estimation (closer to 1.0 is better)
+	pub avg_q_error: f64,
+	// /// Optimality Frequency (OF) - fraction of queries for which the optimizer chooses the relative optimal plan
+	// pub optimality_frequency: f64,
 }
 
 pub struct BenchmarkOutput {
@@ -117,15 +123,40 @@ async fn measure_subplan(
 	cards: &mut Vec<Result<usize, MeasureError>>,
 	times: &mut Vec<Result<Duration, MeasureError>>,
 ) -> anyhow::Result<()> {
+	// First collect all children's cardinalities
+	let mut child_cards = Vec::new();
+	let mut child_times = Vec::new();
+	for child in node.children() {
+		measure_subplan(child.clone(), ctx.clone(), cfg, &mut child_cards, &mut child_times).await?;
+	}
+
+	// Then process the current node
 	if let Some((batches, time)) = time_subplan(node.clone(), ctx.clone(), cfg.timeout).await? {
-		cards.push(Ok(batches.iter().map(|x| x.num_rows()).sum()));
+		println!("\n=== Plan Execution Details ===");
+		println!("Number of batches received: {}", batches.len());
+		for (i, batch) in batches.iter().enumerate() {
+			println!("Batch {}: {} rows × {} columns", i, batch.num_rows(), batch.num_columns());
+		}
+		let cardinality: usize = batches.iter().map(|x| x.num_rows()).sum();
+		println!("Total cardinality: {}", cardinality);
+		println!("Execution time: {:?}", time);
+		println!("============================\n");
+
+		// Push all children's results first
+		cards.extend(child_cards);
+		times.extend(child_times);
+		
+		// Then push current node's result
+		cards.push(Ok(batches.iter().map(|x| x.num_rows()).sum::<usize>()));
 		times.push(Ok(time));
 	} else {
+		// Push all children's results first
+		cards.extend(child_cards);
+		times.extend(child_times);
+		
+		// Then push current node's timeout
 		cards.push(Err(MeasureError::Timeout));
 		times.push(Err(MeasureError::Timeout));
-	}
-	for child in node.children() {
-		measure_subplan(child.clone(), ctx.clone(), cfg, cards, times).await?;
 	}
 	Ok(())
 }
@@ -188,7 +219,6 @@ async fn measure_plan_ipc(
 	schema_file.write_all(bytes.as_bytes())?;
 
 	let out_file = tempfile::NamedTempFile::new()?;
-	// TODO need better solution than relative path lol
 	let output = std::process::Command::new("../optdbg/target/release/runner")
 		.arg("-p").arg(plan_file.path())
 		.arg("-c").arg(cfg_file.path())
@@ -198,7 +228,6 @@ async fn measure_plan_ipc(
 	
 	if !output.success() {
 		let size = plan.size();
-		println!("died");
 		Ok(MeasuredPlan {
 			plan,
 			runtime: Err(MeasureError::Died),
@@ -211,47 +240,6 @@ async fn measure_plan_ipc(
 	}
 }
 
-pub async fn benchmark(
-	sample: SampleOutput,
-	cfg: BenchmarkConfig
-) -> anyhow::Result<BenchmarkOutput> {
-	let ctx = sample.session.task_ctx();
-	let mut out = Vec::new();
-	// TODO best measurement should definitely be interleaved in to avoid
-	// warmup time affecting measurements or something like that...
-	let best = measure_plan_ipc(sample.best_plan, ctx.clone(), &cfg, sample.tables.clone()).await?;
-	for plan in sample.alternates.into_iter()
-		.sorted_by(|x, y| x.est_costs[0].partial_cmp(&y.est_costs[0]).unwrap()) {
-		out.push(measure_plan_ipc(plan, ctx.clone(), &cfg, sample.tables.clone()).await?);
-	}
-	out.sort_by(|x, y| {
-		if x.runtime.is_err() {
-			std::cmp::Ordering::Greater
-		} else if y.runtime.is_err() {
-			std::cmp::Ordering::Less
-		} else {
-			x.runtime.unwrap().cmp(&y.runtime.unwrap())
-		}
-	});
-	let chosen_idx = out.iter()
-		.position(|x| x.runtime.is_err() ||
-				  best.runtime.is_ok() && x.runtime.unwrap() > best.runtime.unwrap())
-		.unwrap_or(out.len());
-	out.insert(chosen_idx, best);
-	
-	// Calculate cost rank accuracy
-	let (taqo_s, taqo_percent) = calculate_cost_rank_accuracy(&out);
-	
-	Ok(BenchmarkOutput {
-		plans: out,
-		chosen_idx,
-		metrics: OptimizerMetrics {
-			taqo_score_s: taqo_s,
-			taqo_accuracy_percent: taqo_percent,
-		}
-	})
-}
-
 /// Calculates the accuracy of cost estimation using TAQO's weighted Kendall's Tau coefficient
 /// Returns the raw score 's' and a derived percentage accuracy (0-100, higher is better).
 fn calculate_cost_rank_accuracy(plans: &[MeasuredPlan]) -> (f64, f64) {
@@ -260,19 +248,20 @@ fn calculate_cost_rank_accuracy(plans: &[MeasuredPlan]) -> (f64, f64) {
 	
 	// Print detailed plan information
 	println!("\nDetailed plan information:");
-	println!("{:<8} {:<15} {:<20} {:<15}", "Plan #", "Runtime (ms)", "Estimated Cost", "Status");
-	println!("{:-<60}", "");
+	println!("{:<8} {:<15} {:<20}", 
+		"Plan #", "Runtime (ms)", "Estimated Cost");
+	println!("{:-<45}", "");
 	
 	for (i, plan) in plans.iter().enumerate() {
 		let runtime = match plan.runtime {
 			Ok(duration) => format!("{:.2}", duration.as_secs_f64() * 1000.0),
 			Err(_) => "Error".to_string(),
 		};
-		let status = if plan.runtime.is_ok() { "Valid" } else { "Invalid" };
-		println!("{:<8} {:<15} {:<20.2} {:<15}", 
-			i, runtime, plan.plan.est_costs[0], status);
+		
+		println!("{:<8} {:<15} {:<20.2}", 
+			i, runtime, plan.plan.est_costs[0]);
 	}
-	println!("{:-<60}\n", "");
+	println!("{:-<45}\n", "");
 	
 	// Collect valid measurements
 	for plan in plans {
@@ -280,8 +269,6 @@ fn calculate_cost_rank_accuracy(plans: &[MeasuredPlan]) -> (f64, f64) {
 			runtime_cost_pairs.push((runtime, plan.plan.est_costs[0]));
 		}
 	}
-	
-	println!("Number of valid plans: {}", runtime_cost_pairs.len());
 	
 	// Find the best actual runtime for weight calculation (a1 in the paper)
 	let best_runtime = runtime_cost_pairs.iter()
@@ -344,13 +331,7 @@ fn calculate_cost_rank_accuracy(plans: &[MeasuredPlan]) -> (f64, f64) {
 		}
 	}
 	
-
 	// Calculate percentage accuracy (0-100, higher is better)
-	// Using exponential decay function: 100 * exp(-|s|)
-	// This creates a curve where:
-	// - s = 0 gives 100% accuracy (perfect correlation)
-	// - As |s| increases, accuracy exponentially decreases
-	// - For very large |s|, accuracy approaches 0%
 	let accuracy_percent = 100.0 * (-s.abs()).exp();
 
 	println!("TAQO Score (s): {:.4} (lower is better)", s);
@@ -358,4 +339,185 @@ fn calculate_cost_rank_accuracy(plans: &[MeasuredPlan]) -> (f64, f64) {
 	
 	// Return the raw score 's' and the percentage accuracy
 	(s, accuracy_percent)
+}
+
+/// Calculates Q-Error between estimated and actual cardinality
+/// Q-Error is defined as max(est/act, act/est) and is always >= 1.0
+/// A Q-Error of 1.0 means perfect estimation
+fn calculate_q_error(estimated: f64, actual: usize) -> f64 {
+	if estimated == 0.0 && actual == 0 {
+		return 1.0; // Perfect estimation
+	}
+	if estimated == 0.0 || actual == 0 {
+		return f64::MAX; // Infinite error
+	}
+	
+	// Calculate Q-Error as max(est/act, act/est)
+	f64::max(
+		estimated / actual as f64,
+		actual as f64 / estimated
+	)
+}
+
+/// Calculates average Q-Error for a plan's cardinality estimations
+/// Returns a value >= 1.0, where 1.0 means perfect estimation
+fn calculate_avg_q_error(plan: &MeasuredPlan) -> f64 {
+	let mut total_q_error = 0.0;
+	let mut valid_counts = 0;
+	
+	for (i, cardinality_result) in plan.cardinalities.iter().enumerate() {
+		if i < plan.plan.est_cards.len() {
+			if let Ok(actual_card) = cardinality_result {
+				// Skip if actual cardinality is 0
+				if *actual_card == 0 {
+					println!("Node {}: Skipping - actual cardinality is 0", i);
+					continue;
+				}
+				
+				let estimated_card = plan.plan.est_cards[i];
+				let q_error = calculate_q_error(estimated_card, *actual_card);
+				if q_error.is_finite() {
+					total_q_error += q_error;
+					valid_counts += 1;
+				}
+			}
+		}
+	}
+	
+	if valid_counts == 0 {
+		return f64::MAX;
+	}
+	
+	total_q_error / valid_counts as f64
+}
+
+/// Calculates the Performance Factor (PF) - the proportion of plans that perform
+/// worse than or equal to the optimizer-chosen plan.
+/// 
+/// PF = 1 indicates the optimizer chose the best possible plan.
+fn calculate_performance_factor(plans: &[MeasuredPlan], chosen_idx: usize) -> f64 {
+	// Get the runtime of the chosen plan
+	let chosen_runtime = match &plans[chosen_idx].runtime {
+		Ok(duration) => Some(*duration),
+		Err(_) => None, // If the chosen plan failed, it can't be compared
+	};
+	
+	if chosen_runtime.is_none() {
+		return 0.0;
+	}
+	
+	// Count the number of plans that perform worse than or equal to the chosen plan
+	let chosen_runtime = chosen_runtime.unwrap();
+	let mut plans_worse_or_equal = 0;
+	let mut valid_plans = 0;
+	
+	for plan in plans {
+		if let Ok(runtime) = plan.runtime {
+			valid_plans += 1;
+			if runtime >= chosen_runtime {
+				plans_worse_or_equal += 1;
+			}
+		}
+	}
+	
+	if valid_plans == 0 {
+		return 0.0;
+	}
+	
+	println!("\nPerformance Factor (PF): {:.2}%", (plans_worse_or_equal as f64 / valid_plans as f64) * 100.0);
+	
+	// Return PF as a fraction (0.0 to 1.0)
+	plans_worse_or_equal as f64 / valid_plans as f64
+}
+
+pub async fn benchmark(
+	sample: SampleOutput,
+	cfg: BenchmarkConfig
+) -> anyhow::Result<BenchmarkOutput> {
+	let ctx = sample.session.task_ctx();
+	let mut out = Vec::new();
+	// TODO best measurement should definitely be interleaved in to avoid
+	// warmup time affecting measurements or something like that...
+	let best = measure_plan_ipc(sample.best_plan, ctx.clone(), &cfg, sample.tables.clone()).await?;
+	for plan in sample.alternates.into_iter()
+		.sorted_by(|x, y| x.est_costs[0].partial_cmp(&y.est_costs[0]).unwrap()) {
+		out.push(measure_plan_ipc(plan, ctx.clone(), &cfg, sample.tables.clone()).await?);
+	}
+	out.sort_by(|x, y| {
+		if x.runtime.is_err() {
+			std::cmp::Ordering::Greater
+		} else if y.runtime.is_err() {
+			std::cmp::Ordering::Less
+		} else {
+			x.runtime.unwrap().cmp(&y.runtime.unwrap())
+		}
+	});
+	let chosen_idx = out.iter()
+		.position(|x| x.runtime.is_err() ||
+				  best.runtime.is_ok() && x.runtime.unwrap() > best.runtime.unwrap())
+		.unwrap_or(out.len());
+	out.insert(chosen_idx, best);
+	
+	// Calculate cost rank accuracy
+	let (taqo_s, taqo_percent) = calculate_cost_rank_accuracy(&out);
+	
+	// Calculate Performance Factor (PF)
+	let performance_factor = calculate_performance_factor(&out, chosen_idx);
+	
+	// Calculate average Q-Error for the chosen plan
+	let avg_q_error = calculate_avg_q_error(&out[chosen_idx]);
+	
+	// Print Q-Error analysis
+	println!("\nCardinality Estimation Q-Error Analysis (only best plan):");
+	println!("Average Q-Error: {:.2} (closer to 1.0 is better)", avg_q_error);
+	
+	if avg_q_error.is_finite() && avg_q_error <= 2.0 {
+		println!("Cardinality estimation is excellent (avg Q-Error ≤ 2.0)");
+	} else if avg_q_error.is_finite() && avg_q_error <= 4.0 {
+		println!("Cardinality estimation is good (avg Q-Error ≤ 4.0)");
+	} else if avg_q_error.is_finite() && avg_q_error <= 10.0 {
+		println!("Cardinality estimation is acceptable (avg Q-Error ≤ 10.0)");
+	} else if avg_q_error.is_finite() {
+		println!("Cardinality estimation needs improvement (avg Q-Error > 10.0)");
+	} else {
+		println!("Cardinality estimation cannot be evaluated");
+	}
+	
+	Ok(BenchmarkOutput {
+		plans: out,
+		chosen_idx,
+		metrics: OptimizerMetrics {
+			taqo_score_s: taqo_s,
+			taqo_accuracy_percent: taqo_percent,
+			performance_factor,
+			avg_q_error,
+		}
+	})
+}
+
+/// Calculates the Optimality Frequency (OF) across a workload of queries.
+/// 
+/// OF is the fraction of queries for which the optimizer chooses the relative optimal plan (PF = 1).
+/// 
+/// Returns a value between 0.0 and 1.0, where 1.0 means the optimizer chose the best plan for all queries.
+pub fn calculate_optimality_frequency(benchmark_results: &[BenchmarkOutput]) -> f64 {
+	if benchmark_results.is_empty() {
+		return 0.0;
+	}
+	
+	// Count queries where PF = 1 (optimizer chose the best plan)
+	let optimal_queries = benchmark_results.iter()
+		.filter(|result| {
+			// Check if PF is 1.0 (or very close to 1.0 due to floating-point precision)
+			(result.metrics.performance_factor - 1.0).abs() < 1e-6
+		})
+		.count();
+	
+	// Print OF analysis
+	println!("\nOptimality Frequency (OF) Analysis:");
+	println!("Queries with optimal plan selection: {}/{}", optimal_queries, benchmark_results.len());
+	println!("Optimality Frequency: {:.2}%", (optimal_queries as f64 / benchmark_results.len() as f64) * 100.0);
+	
+	// Return OF as a fraction (0.0 to 1.0)
+	optimal_queries as f64 / benchmark_results.len() as f64
 }
