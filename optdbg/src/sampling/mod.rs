@@ -395,7 +395,7 @@ impl OptdOldBackend {
     ) -> Result<Vec<Plan>> {
         let opt = self.opt.as_mut().unwrap();
         let pl = self.plan.clone().unwrap();
-        let mut out = Vec::new();
+        let mut out = HashSet::new();
 
         let defaults: Vec<Arc<dyn Rule<DfNodeType, OptdCascadesOptimizer<DfNodeType>>>> = vec![
             Arc::new(rules::FilterInnerJoinTransposeRule::new()),
@@ -481,7 +481,7 @@ impl OptdOldBackend {
 
             if !out.contains(&phys_plan) && *self.best.as_ref().unwrap() != phys_plan {
                 println!("{}", phys_plan);
-                out.push(phys_plan);
+                out.insert(phys_plan);
                 if let RuleBailStrategy::Threshold(thres) = bail {
                     if out.len() == thres {
                         break;
@@ -490,7 +490,8 @@ impl OptdOldBackend {
                 println!("Have {} alternate plans", out.len());
             }
         }
-        Ok(out)
+
+        Ok(out.iter().cloned().collect_vec())
     }
 }
 
