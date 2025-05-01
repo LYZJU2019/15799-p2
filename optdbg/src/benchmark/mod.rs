@@ -2,6 +2,7 @@ use std::io::Write;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use std::collections::HashMap;
+use std::cmp::Ordering;
 
 use datafusion::arrow::array::RecordBatch;
 use datafusion::catalog::SchemaProvider;
@@ -17,11 +18,153 @@ use child_wait_timeout::ChildWT;
 use crate::sampling::SampleOutput;
 use crate::common::{dump_plan, MeasureError, Plan, PlanMeasurements};
 
+// New runtime statistics struct to collect data from multiple runs
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuntimeStats {
+	/// Individual measurements
+	pub measurements: Vec<Duration>,
+	/// Mean (average) runtime
+	pub mean: Duration,
+	/// Standard deviation
+	pub stddev: Duration,
+	/// Minimum runtime
+	pub min: Duration,
+	/// Maximum runtime
+	pub max: Duration,
+	/// Coefficient of variation (stddev/mean as a percentage)
+	pub cv_percent: f64,
+}
+
+impl RuntimeStats {
+	/// Create new RuntimeStats from a vector of measurements
+	pub fn new(measurements: Vec<Duration>) -> Self {
+		if measurements.is_empty() {
+			return Self {
+				measurements: vec![],
+				mean: Duration::from_secs(0),
+				stddev: Duration::from_secs(0),
+				min: Duration::from_secs(0),
+				max: Duration::from_secs(0),
+				cv_percent: 0.0,
+			};
+		}
+
+		// Calculate min and max
+		let min = *measurements.iter().min().unwrap();
+		let max = *measurements.iter().max().unwrap();
+		
+		// Calculate mean
+		let sum: Duration = measurements.iter().sum();
+		let mean = sum / measurements.len() as u32;
+		
+		// Calculate standard deviation
+		let mean_secs = mean.as_secs_f64();
+		let variance: f64 = measurements.iter()
+			.map(|d| {
+				let diff = d.as_secs_f64() - mean_secs;
+				diff * diff
+			})
+			.sum::<f64>() / measurements.len() as f64;
+		let stddev_secs = variance.sqrt();
+		let stddev = Duration::from_secs_f64(stddev_secs);
+		
+		// Calculate coefficient of variation (as a percentage)
+		let cv_percent = if mean_secs > 0.0 {
+			(stddev_secs / mean_secs) * 100.0
+		} else {
+			0.0
+		};
+		
+		Self {
+			measurements,
+			mean,
+			stddev,
+			min,
+			max,
+			cv_percent,
+		}
+	}
+	
+	/// Create a RuntimeStats from a single Duration
+	pub fn from_duration(duration: Duration) -> Self {
+		Self {
+			measurements: vec![duration],
+			mean: duration,
+			stddev: Duration::from_secs(0),
+			min: duration,
+			max: duration,
+			cv_percent: 0.0,
+		}
+	}
+	
+	/// Check if this runtime's range significantly overlaps with another
+	pub fn overlaps_with(&self, other: &Self, significance_threshold: f64) -> bool {
+		// Calculate the overlap of confidence intervals
+		// Using mean ± stddev as a simple confidence interval
+		let self_low = self.mean.as_secs_f64() - self.stddev.as_secs_f64();
+		let self_high = self.mean.as_secs_f64() + self.stddev.as_secs_f64();
+		let other_low = other.mean.as_secs_f64() - other.stddev.as_secs_f64();
+		let other_high = other.mean.as_secs_f64() + other.stddev.as_secs_f64();
+		
+		// Check if ranges overlap
+		if self_high < other_low || self_low > other_high {
+			return false; // No overlap
+		}
+		
+		// Calculate overlap percentage
+		let overlap_start = f64::max(self_low, other_low);
+		let overlap_end = f64::min(self_high, other_high);
+		let overlap_length = overlap_end - overlap_start;
+		
+		// Calculate total range lengths
+		let self_range = self_high - self_low;
+		let other_range = other_high - other_low;
+		
+		// Calculate overlap as percentage of the smaller range
+		let min_range = f64::min(self_range, other_range);
+		if min_range == 0.0 {
+			return false;
+		}
+		
+		let overlap_percentage = overlap_length / min_range;
+		
+		// Return true if overlap exceeds threshold
+		overlap_percentage >= significance_threshold
+	}
+}
+
+impl PartialEq for RuntimeStats {
+	fn eq(&self, other: &Self) -> bool {
+		// Consider equal if confidence intervals overlap significantly
+		self.overlaps_with(other, 0.5) // 50% overlap threshold
+	}
+}
+
+impl Eq for RuntimeStats {}
+
+impl PartialOrd for RuntimeStats {
+	fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+		Some(self.cmp(other))
+	}
+}
+
+impl Ord for RuntimeStats {
+	fn cmp(&self, other: &Self) -> Ordering {
+		// If they overlap significantly, consider them equal
+		if self.eq(other) {
+			return Ordering::Equal;
+		}
+		
+		// Otherwise compare means
+		self.mean.cmp(&other.mean)
+	}
+}
+
 // Plan cache to avoid re-executing identical plans
 #[derive(Default)]
 struct PlanCache {
 	// Maps plan hash to execution results (cardinality, duration)
-	cache: HashMap<u64, Result<(usize, Duration), MeasureError>>,
+	cache: HashMap<u64, Result<(usize, RuntimeStats), MeasureError>>,
 	// Track cache hits for statistics
 	hits: usize,
 	// Track cache misses
@@ -38,7 +181,7 @@ impl PlanCache {
 	}
 
 	// Try to get a cached result
-	fn get(&mut self, plan_hash: u64) -> Option<&Result<(usize, Duration), MeasureError>> {
+	fn get(&mut self, plan_hash: u64) -> Option<&Result<(usize, RuntimeStats), MeasureError>> {
 		if let Some(result) = self.cache.get(&plan_hash) {
 			self.hits += 1;
 			Some(result)
@@ -49,7 +192,7 @@ impl PlanCache {
 	}
 
 	// Cache a new result
-	fn insert(&mut self, plan_hash: u64, result: Result<(usize, Duration), MeasureError>) {
+	fn insert(&mut self, plan_hash: u64, result: Result<(usize, RuntimeStats), MeasureError>) {
 		self.cache.insert(plan_hash, result);
 	}
 
@@ -123,6 +266,25 @@ pub struct BenchmarkConfig {
 	pub fast: bool,
 	pub timeout: Option<Duration>,
 	pub enable_cache: bool,
+	/// Number of times to run each benchmark
+	pub num_runs: usize,
+	/// Whether to drop the highest and lowest measurements
+	pub drop_outliers: bool,
+	/// Standard deviation overlap threshold to consider runtimes equal (0.0-1.0)
+	pub overlap_threshold: f64,
+}
+
+impl Default for BenchmarkConfig {
+	fn default() -> Self {
+		Self {
+			fast: false,
+			timeout: Some(Duration::from_secs(5)),
+			enable_cache: true,
+			num_runs: 3,
+			drop_outliers: false,
+			overlap_threshold: 0.5,
+		}
+	}
 }
 
 // placeholder type
@@ -151,31 +313,35 @@ pub struct BenchmarkOutput {
 pub struct MeasuredPlan {
 	pub plan: Plan,
 	/// Time it took to run the overall plan. None if timeout hit.
-	pub runtime: Result<Duration, MeasureError>,
+	pub runtime: Result<RuntimeStats, MeasureError>,
 	/// Preorder array of each subplan's true cardinality.
 	pub cardinalities: Vec<Result<usize, MeasureError>>,
 	/// Preorder array of each subplan's runtime.
-	pub sub_runtimes: Option<Vec<Result<Duration, MeasureError>>>,
+	pub sub_runtimes: Option<Vec<Result<RuntimeStats, MeasureError>>>,
 }
 
 
 impl std::fmt::Display for MeasuredPlan {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 		let times = self.sub_runtimes
 			.as_ref()
 			.unwrap()
 			.iter()
-			.map(|x| x.map(|x| x.as_millis()).unwrap_or(9999999)).collect();
-        let mut i = 0;
-        crate::common::format_plan_with_2preorder_help(
-            f,
-            self.plan.tree.clone(),
-            0,
-            &times,
-            &self.plan.est_costs,
-            &mut i,
-        )
-    }
+			.map(|x| match x {
+				Ok(stats) => stats.mean.as_millis(),
+				Err(_) => 9999999
+			}).collect::<Vec<_>>();
+		
+		let mut i = 0;
+		crate::common::format_plan_with_2preorder_help(
+			f,
+			self.plan.tree.clone(),
+			0,
+			&times,
+			&self.plan.est_costs,
+			&mut i,
+		)
+	}
 }
 
 impl MeasuredPlan {
@@ -183,165 +349,30 @@ impl MeasuredPlan {
 		plan: Plan,
 		measurements: PlanMeasurements
 	) -> Self {
+		// Extract first runtime before moving anything
+		let first_runtime = measurements.sub_runtimes.as_ref()
+			.and_then(|runtimes| runtimes.get(0).cloned())
+			.map(|result| result.map(RuntimeStats::from_duration));
+		
+		// Convert Duration results to RuntimeStats results
+		let converted_runtimes = measurements.sub_runtimes.map(|runtimes| {
+			runtimes.into_iter()
+				.map(|result| {
+					result.map(|duration| RuntimeStats::from_duration(duration))
+				})
+				.collect()
+		});
+		
 		Self {
 			plan,
-			// FIXME need to change this when implementing covering queries!
-			runtime: measurements.sub_runtimes.as_ref().unwrap()[0].clone(),
+			runtime: first_runtime.unwrap_or(Err(MeasureError::Died)),
 			cardinalities: measurements.cardinalities,
-			sub_runtimes: measurements.sub_runtimes
+			sub_runtimes: converted_runtimes,
 		}
 	}
 }
 
-// /// Times a subplan's execution, giving up after a timeout.
-// async fn time_subplan(
-// 	node: Arc<dyn ExecutionPlan>,
-// 	ctx: Arc<TaskContext>,
-// 	timeout: Option<Duration>,
-// ) -> anyhow::Result<Option<(Vec<RecordBatch>, Duration)>> {
-// 	// Ensure a timeout is set
-// 	let timeout = timeout.unwrap_or(Duration::from_secs(5));
-// 	// Calculate hard timeout (1.5 times the original timeout)
-// 	let hard_timeout = timeout.checked_add(timeout.checked_div(2).unwrap_or(Duration::from_millis(500))).unwrap_or(Duration::from_secs(10));
-	
-// 	// Start timing
-// 	let start = Instant::now();
-	
-// 	// Create two channels for communication
-// 	let (result_tx, result_rx) = tokio::sync::oneshot::channel();
-// 	let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
-	
-// 	// Start execution task
-// 	let handle = tokio::spawn(async move {
-// 		// Catch potential panics
-// 		let result = match tokio::task::spawn(async {
-// 			collect(node, ctx).await
-// 		}).await {
-// 			Ok(res) => res,
-// 			Err(e) => {
-// 				println!("Worker thread panicked: {}", e);
-// 				Err(datafusion::error::DataFusionError::Execution("Panic occurred during query execution".to_string()))
-// 			}
-// 		};
-		
-// 		// Send result (success or error)
-// 		let elapsed = start.elapsed();
-// 		let _ = result_tx.send((result, elapsed));
-// 	});
-	
-// 	// Start timeout task
-// 	tokio::spawn(async move {
-// 		tokio::time::sleep(timeout).await;
-// 		let _ = cancel_tx.send(());
-// 	});
-	
-// 	// Wait for result or timeout
-// 	tokio::select! {
-// 		result = result_rx => {
-// 			match result {
-// 				Ok((res, time)) => {
-// 					println!("Query completed in {:?}", time);
-// 					match res {
-// 						Ok(data) => Ok(Some((data, time))),
-// 						Err(e) => {
-// 							println!("Error during execution: {}", e);
-// 							Ok(None)
-// 						}
-// 					}
-// 				},
-// 				Err(e) => {
-// 					println!("Channel closed unexpectedly: {}", e);
-// 					Ok(None)
-// 				}
-// 			}
-// 		},
-// 		_ = cancel_rx => {
-// 			println!("Timeout reached, cancelling task");
-// 			handle.abort();
-// 			Ok(None)
-// 		},
-// 		// Hard timeout to ensure no indefinite waiting
-// 		_ = tokio::time::sleep(hard_timeout) => {
-// 			println!("Hard timeout reached");
-// 			handle.abort();
-// 			Ok(None)
-// 		}
-// 	}
-// }
-
-// /// Recursively populate cardinality and runtime arrays.
-// // TODO need to be a *lot* more rigorous for the actual benchmarking here.
-// // one option is to try and integrate an existing optimizer like criterion
-// // or divan. Both of these don't really support usage as a library though...
-// // Doing this properly is an easy way to surpass TAQO.
-// //
-// // The other major TODO (this is long term) is to support the `fast` option 
-// // and implement the optimization in www.vldb.org/pvldb/vol2/vldb09-294.pdf
-// #[async_recursion]
-// async fn measure_subplan(
-// 	node: Arc<dyn ExecutionPlan>,
-// 	ctx: Arc<TaskContext>,
-// 	cfg: &BenchmarkConfig,
-// 	cards: &mut Vec<Result<usize, MeasureError>>,
-// 	times: &mut Vec<Result<Duration, MeasureError>>,
-// ) -> anyhow::Result<()> {
-// 	// First execute the current node
-// 	if let Some((batches, time)) = time_subplan(node.clone(), ctx.clone(), cfg.timeout).await? {
-// 		println!("\n=== Plan Execution Details ===");
-// 		println!("Number of batches received: {}", batches.len());
-// 		for (i, batch) in batches.iter().enumerate() {
-// 			println!("Batch {}: {} rows × {} columns", i, batch.num_rows(), batch.num_columns());
-// 		}
-// 		let cardinality: usize = batches.iter().map(|x| x.num_rows()).sum();
-// 		println!("Total cardinality: {}", cardinality);
-// 		println!("Execution time: {:?}", time);
-// 		println!("============================\n");
-		
-// 		// Push current node's result
-// 		cards.push(Ok(cardinality));
-// 		times.push(Ok(time));
-		
-// 		// If current node executed successfully, then process its children
-// 		for i in 0..node.children().len() {
-// 			let child = node.children()[i].clone();
-// 			measure_subplan(child, ctx.clone(), cfg, cards, times).await?;
-// 		}
-// 	} else {
-// 		// Current node timed out, no need to process children
-// 		cards.push(Err(MeasureError::Timeout));
-// 		times.push(Err(MeasureError::Timeout));
-		
-// 		// Use a non-recursive approach to mark all descendants as errors
-// 		// First, add all immediate children to our stack
-// 		let mut stack = Vec::new();
-// 		for i in 0..node.children().len() {
-// 			stack.push(node.children()[i].clone());
-// 		}
-		
-// 		// Process the stack until empty
-// 		while let Some(child_node) = stack.pop() {
-// 			// Mark this node as timeout error
-// 			cards.push(Err(MeasureError::Timeout));
-// 			times.push(Err(MeasureError::Timeout));
-			
-// 			// Add its children to the stack
-// 			for i in 0..child_node.children().len() {
-// 				stack.push(child_node.children()[i].clone());
-// 			}
-// 		}
-// 	}
-// 	Ok(())
-// }
-
-
 /// Recursively populate cardinality and runtime arrays.
-// TODO need to be a *lot* more rigorous for the actual benchmarking here.
-// one option is to try and integrate an existing optimizer like criterion
-// or divan. Both of these don't really support usage as a library though...
-// Doing this properly is an easy way to surpass TAQO.
-//
-// The other major TODO (this is long term) is to support the `fast` option 
-// and implement the optimization in www.vldb.org/pvldb/vol2/vldb09-294.pdf
 #[async_recursion]
 async fn measure_subplan(
 	node: Arc<dyn ExecutionPlan>,
@@ -350,30 +381,27 @@ async fn measure_subplan(
 	est_costs: &Vec<f64>,
 	idx: &mut usize,
 	cards: &mut Vec<Result<usize, MeasureError>>,
-	times: &mut Vec<Result<Duration, MeasureError>>,
+	times: &mut Vec<Result<RuntimeStats, MeasureError>>,
 	tables: Arc<dyn SchemaProvider>,
 ) -> anyhow::Result<()> {
 	// FIXME temporary hack
 	println!("est cost is {}", est_costs[*idx]);
-	// if est_costs[*idx] > 1000000000000.0 || node.name() == "CrossJoinExec" {
-	// 	cards.push(Err(MeasureError::Died));
-	// 	times.push(Err(MeasureError::Died));
-	// } else { 
-		println!("Timing subplan");
-		crate::common::dump_plan(node.clone(), 0);	
-		match time_subplan_ipc(node.clone(), cfg, tables.clone()).await? {
-			Ok((card, time)) => {
-				cards.push(Ok(card));
-				println!("got {} and putting result into index {}",
-						 time.as_millis(), times.len());
-				times.push(Ok(time));
-			},
-			Err(e) => {
-				cards.push(Err(e));
-				times.push(Err(e));
-			}
+	
+	println!("Timing subplan");
+	crate::common::dump_plan(node.clone(), 0);	
+	match time_subplan_ipc(node.clone(), cfg, tables.clone()).await? {
+		Ok((card, runtime_stats)) => {
+			cards.push(Ok(card));
+			println!("got {} ms (mean) and putting result into index {}",
+					runtime_stats.mean.as_millis(), times.len());
+			times.push(Ok(runtime_stats));
+		},
+		Err(e) => {
+			cards.push(Err(e));
+			times.push(Err(e));
 		}
-	// }
+	}
+
 	for child in node.children() {
 		*idx += 1;
 		measure_subplan(child.clone(), ctx.clone(), cfg, &est_costs,
@@ -383,9 +411,6 @@ async fn measure_subplan(
 }
 
 /// Measure cardinalities and runtimes of plan and subplans.
-///
-/// Use `measure_ipc` for OOM safety (which is a real concern).
-// TODO think of a more consistent hack? do we bother keeping this at all?
 async fn measure_plan(
 	plan: Plan,
 	ctx: Arc<TaskContext>,
@@ -400,14 +425,22 @@ async fn measure_plan(
 	let mut idx = 0;
 	measure_subplan(plan.tree.clone(), ctx, cfg, &plan.est_costs, &mut idx,
 					&mut cardinalities, &mut runtimes, tables).await?;
-	if let Ok(runtime) = runtimes[0] {
-		println!("ran plan in {}ms (est cost {})", runtime.as_millis(), plan.est_costs[0]);
+	
+	if let Ok(runtime_stats) = &runtimes[0] {
+		println!("ran plan in {}ms mean (stddev: {}ms, min: {}ms, max: {}ms, CV: {:.2}%) (est cost {})", 
+		         runtime_stats.mean.as_millis(), 
+		         runtime_stats.stddev.as_millis(),
+		         runtime_stats.min.as_millis(),
+		         runtime_stats.max.as_millis(),
+		         runtime_stats.cv_percent,
+		         plan.est_costs[0]);
 	} else {
 		println!("plan timed out (est cost {})", plan.est_costs[0]);
 	}
+	
 	Ok(MeasuredPlan {
 		plan,
-		runtime: runtimes[0],
+		runtime: runtimes[0].clone(),
 		cardinalities,
 		sub_runtimes: Some(runtimes),
 	})
@@ -418,15 +451,15 @@ async fn time_subplan_ipc(
 	plan: Arc<dyn ExecutionPlan>,
 	cfg: &BenchmarkConfig,
 	tables: Arc<dyn SchemaProvider>,
-) -> anyhow::Result<Result<(usize, Duration), MeasureError>> {
+) -> anyhow::Result<Result<(usize, RuntimeStats), MeasureError>> {
 	// Skip cache if caching is disabled in config
 	if !cfg.enable_cache {
-		return run_plan_ipc(plan, cfg, tables).await;
+		return run_plan_ipc_multiple(plan, cfg, tables).await;
 	}
 	
 	// Only cache if plan is small enough
 	if !is_plan_cacheable(&plan) {
-		return run_plan_ipc(plan, cfg, tables).await;
+		return run_plan_ipc_multiple(plan, cfg, tables).await;
 	}
 	
 	// Calculate plan hash
@@ -443,7 +476,7 @@ async fn time_subplan_ipc(
 	}
 	
 	// Cache miss, execute the plan
-	let result = run_plan_ipc(plan, cfg, tables).await?;
+	let result = run_plan_ipc_multiple(plan, cfg, tables).await?;
 	
 	// Update cache with new result
 	PLAN_CACHE.with(|cache| {
@@ -460,6 +493,67 @@ async fn time_subplan_ipc(
 	});
 	
 	Ok(result)
+}
+
+/// Run a plan multiple times and collect statistics
+async fn run_plan_ipc_multiple(
+	plan: Arc<dyn ExecutionPlan>,
+	cfg: &BenchmarkConfig,
+	tables: Arc<dyn SchemaProvider>,
+) -> anyhow::Result<Result<(usize, RuntimeStats), MeasureError>> {
+	let num_runs = cfg.num_runs.max(1); // Ensure at least one run
+	
+	let mut measurements = Vec::with_capacity(num_runs);
+	let mut cardinality = 0;
+	
+	println!("Running plan {} times", num_runs);
+	
+	for i in 0..num_runs {
+		println!("Run {}/{}", i+1, num_runs);
+		match run_plan_ipc(plan.clone(), cfg, tables.clone()).await? {
+			Ok((card, duration)) => {
+				// For the first successful run, set the cardinality
+				if measurements.is_empty() {
+					cardinality = card;
+				}
+				measurements.push(duration);
+				println!("Run {}: {} ms", i+1, duration.as_millis());
+			},
+			Err(e) => {
+				// If any run fails, return the error
+				println!("Run {} failed with error: {:?}", i+1, e);
+				return Ok(Err(e));
+			}
+		}
+	}
+	
+	if measurements.is_empty() {
+		return Ok(Err(MeasureError::Timeout));
+	}
+	
+	// Process measurements
+	if cfg.drop_outliers && measurements.len() >= 3 {
+		// Sort by duration
+		measurements.sort();
+		
+		// Remove highest and lowest
+		measurements.remove(0);
+		measurements.pop();
+		
+		println!("Dropped highest and lowest measurements, keeping {} runs", measurements.len());
+	}
+	
+	// Create runtime statistics
+	let stats = RuntimeStats::new(measurements);
+	
+	println!("Final stats: mean={}ms, stddev={}ms, min={}ms, max={}ms, CV={:.2}%",
+			 stats.mean.as_millis(), 
+			 stats.stddev.as_millis(),
+			 stats.min.as_millis(),
+			 stats.max.as_millis(),
+			 stats.cv_percent);
+	
+	Ok(Ok((cardinality, stats)))
 }
 
 /// Actual implementation that runs the plan through IPC
@@ -510,42 +604,44 @@ async fn run_plan_ipc(
 /// Returns the raw score 's' and a derived percentage accuracy (0-100, higher is better).
 fn calculate_cost_rank_accuracy(plans: &[MeasuredPlan]) -> (f64, f64) {
 	// Create a vector of (actual_runtime, estimated_cost) pairs
-	let mut runtime_cost_pairs: Vec<(Duration, f64)> = Vec::new();
+	let mut runtime_cost_pairs: Vec<(RuntimeStats, f64)> = Vec::new();
 	
 	// Print detailed plan information
 	println!("\nDetailed plan information:");
-	println!("{:<8} {:<15} {:<20}", 
-		"Plan #", "Runtime (ms)", "Estimated Cost");
-	println!("{:-<45}", "");
+	println!("{:<8} {:<30} {:<20}", 
+		"Plan #", "Runtime (mean ± stddev ms)", "Estimated Cost");
+	println!("{:-<60}", "");
 	
 	for (i, plan) in plans.iter().enumerate() {
-		let runtime = match plan.runtime {
-			Ok(duration) => format!("{:.2}", duration.as_secs_f64() * 1000.0),
+		let runtime_str = match &plan.runtime {
+			Ok(stats) => format!("{:.2} ± {:.2}", 
+								stats.mean.as_secs_f64() * 1000.0,
+								stats.stddev.as_secs_f64() * 1000.0),
 			Err(_) => "Error".to_string(),
 		};
 		
-		println!("{:<8} {:<15} {:<20.2}", 
-			i, runtime, plan.plan.est_costs[0]);
+		println!("{:<8} {:<30} {:<20.2}", 
+			i, runtime_str, plan.plan.est_costs[0]);
 	}
-	println!("{:-<45}\n", "");
+	println!("{:-<60}\n", "");
 	
 	// Collect valid measurements
 	for plan in plans {
-		if let Ok(runtime) = plan.runtime {
-			runtime_cost_pairs.push((runtime, plan.plan.est_costs[0]));
+		if let Ok(runtime_stats) = &plan.runtime {
+			runtime_cost_pairs.push((runtime_stats.clone(), plan.plan.est_costs[0]));
 		}
 	}
 	
 	// Find the best actual runtime for weight calculation (a1 in the paper)
 	let best_runtime = runtime_cost_pairs.iter()
-		.map(|(r, _)| *r)
+		.map(|(r, _)| r.mean)
 		.min()
 		.unwrap();
 	
 	// Find min and max values for normalization (a_n, a_1, max(e_k), min(e_k))
 	let min_r = best_runtime.as_secs_f64(); // a1
 	let max_r = runtime_cost_pairs.iter()
-		.map(|(r, _)| r.as_secs_f64())
+		.map(|(r, _)| r.mean.as_secs_f64())
 		.max_by(|a, b| a.partial_cmp(b).unwrap()) // a_n
 		.unwrap();
 	let min_e = runtime_cost_pairs.iter()
@@ -567,16 +663,16 @@ fn calculate_cost_rank_accuracy(plans: &[MeasuredPlan]) -> (f64, f64) {
 	
 	for i in 0..n {
 		for j in (i+1)..n {
-			let (r_i_dur, e_i) = runtime_cost_pairs[i];
-			let (r_j_dur, e_j) = runtime_cost_pairs[j];
+			let (r_i_stats, e_i) = &runtime_cost_pairs[i];
+			let (r_j_stats, e_j) = &runtime_cost_pairs[j];
 			
 			// Skip pairs with identical estimated costs (sgn(0) is undefined/ignored)
 			if e_i == e_j {
 				continue;
 			}
 
-			let r_i = r_i_dur.as_secs_f64(); // a_i
-			let r_j = r_j_dur.as_secs_f64(); // a_j
+			let r_i = r_i_stats.mean.as_secs_f64(); // a_i
+			let r_j = r_j_stats.mean.as_secs_f64(); // a_j
 			
 			// Calculate weights (Equation 2, w_m = a1 / am)
 			let w_i = if r_i > 0.0 { min_r / r_i } else { 0.0 }; 
@@ -661,7 +757,7 @@ fn calculate_avg_q_error(plan: &MeasuredPlan) -> f64 {
 fn calculate_performance_factor(plans: &[MeasuredPlan], chosen_idx: usize) -> f64 {
 	// Get the runtime of the chosen plan
 	let chosen_runtime = match &plans[chosen_idx].runtime {
-		Ok(duration) => Some(*duration),
+		Ok(stats) => Some(stats),
 		Err(_) => None, // If the chosen plan failed, it can't be compared
 	};
 	
@@ -675,8 +771,9 @@ fn calculate_performance_factor(plans: &[MeasuredPlan], chosen_idx: usize) -> f6
 	let mut valid_plans = 0;
 	
 	for plan in plans {
-		if let Ok(runtime) = plan.runtime {
+		if let Ok(runtime) = &plan.runtime {
 			valid_plans += 1;
+			// Using custom Ord implementation which considers overlapping ranges
 			if runtime >= chosen_runtime {
 				plans_worse_or_equal += 1;
 			}
@@ -731,19 +828,33 @@ pub fn benchmark(
 			.sorted_by(|x, y| x.est_costs[0].partial_cmp(&y.est_costs[0]).unwrap()) {
 				out.push(measure_plan(plan, ctx.clone(), &cfg, sample.tables.clone()).await?);
 			}
+		
+		// Sort by runtime (mean) for non-error plans
 		out.sort_by(|x, y| {
 			if x.runtime.is_err() {
 				std::cmp::Ordering::Greater
 			} else if y.runtime.is_err() {
 				std::cmp::Ordering::Less
 			} else {
-				x.runtime.unwrap().cmp(&y.runtime.unwrap())
+				// Use the custom comparison which considers overlapping ranges
+				x.runtime.as_ref().unwrap().cmp(&y.runtime.as_ref().unwrap())
 			}
 		});
+		
+		// Find the position for the chosen plan
 		let chosen_idx = out.iter()
-			.position(|x| x.runtime.is_err() ||
-					  best.runtime.is_ok() && x.runtime.unwrap() > best.runtime.unwrap())
+			.position(|x| {
+				if x.runtime.is_err() {
+					return true;
+				}
+				if best.runtime.is_err() {
+					return false;
+				}
+				// Use the custom comparison which considers overlapping ranges
+				x.runtime.as_ref().unwrap() > best.runtime.as_ref().unwrap()
+			})
 			.unwrap_or(out.len());
+		
 		out.insert(chosen_idx, best);
 		
 		// Calculate cost rank accuracy

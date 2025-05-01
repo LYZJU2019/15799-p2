@@ -109,7 +109,7 @@ impl std::fmt::Display for QueryReport {
 		let mut perfgraph = Graph::default();
 		let data: Vec<_> = self.samples
 			.iter()
-			.filter_map(|x| x.runtime.ok().map(|y| y.as_millis() as usize))
+			.filter_map(|x| x.runtime.as_ref().ok().map(|y| y.mean.as_millis() as usize))
 			.collect();
 		perfgraph.set_1d_data(&data);
 		writeln!(f, "{perfgraph}")?;
@@ -201,33 +201,30 @@ pub async fn analyze(
 			let sz = plan.plan.size();
 			let plan_problems = problems.get_mut(&i).unwrap();
 			for n_i in 0..sz {
-				let Ok(runtime) = plan.sub_runtimes.as_ref().unwrap()[n_i] else {
-					continue
-				};
-				let mut est_rank = 0;
-				let mut real_rank = 0;
-				for (j, oplan) in bench.plans.iter().enumerate() {
-					if i == j { continue }
-					if partial_eq_plans(plan.plan.tree.clone(), oplan.plan.tree.clone(), n_i) {
-						let Ok(oruntime) = oplan.sub_runtimes.as_ref().unwrap()[n_i] else {
-							continue
-						};
-						if oplan.plan.est_costs[n_i] < plan.plan.est_costs[n_i] {
-							est_rank += 1;
-						}
-						if oruntime < runtime
-						{
-							real_rank += 1;
+				if let Ok(runtime) = &plan.sub_runtimes.as_ref().unwrap()[n_i] {
+					let mut est_rank = 0;
+					let mut real_rank = 0;
+					for (j, oplan) in bench.plans.iter().enumerate() {
+						if i == j { continue }
+						if partial_eq_plans(plan.plan.tree.clone(), oplan.plan.tree.clone(), n_i) {
+							if let Ok(oruntime) = &oplan.sub_runtimes.as_ref().unwrap()[n_i] {
+								if oplan.plan.est_costs[n_i] < plan.plan.est_costs[n_i] {
+									est_rank += 1;
+								}
+								if oruntime.mean.as_millis() < runtime.mean.as_millis() {
+									real_rank += 1;
+								}
+							}
 						}
 					}
-				}
-				if est_rank != real_rank {
-					add_problem(plan_problems, &n_i, NodeProblem::CostMisestimation(
-						runtime.as_millis(),
-						plan.plan.est_costs[n_i],
-						est_rank,
-						real_rank,
-					));
+					if est_rank != real_rank {
+						add_problem(plan_problems, &n_i, NodeProblem::CostMisestimation(
+							runtime.mean.as_millis(),
+							plan.plan.est_costs[n_i],
+							est_rank,
+							real_rank,
+						));
+					}
 				}
 			}
 		}

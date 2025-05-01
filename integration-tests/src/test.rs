@@ -26,6 +26,9 @@ async fn main() -> anyhow::Result<()> {
         timeout: Some(std::time::Duration::from_secs(10)),
         fast: false,
         enable_cache: true, // Enable plan caching to avoid re-running identical plans
+        num_runs: 5, // Run each plan 5 times to get statistical significance
+        drop_outliers: true, // Drop highest and lowest measurements to reduce noise
+        overlap_threshold: 0.5, // Consider runtimes equal if their ranges overlap by 50%
     };
 
     let a_cfg = AnalysisConfig;

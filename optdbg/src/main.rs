@@ -84,6 +84,9 @@ impl Args {
 				timeout: self.timeout.map(|x| x.0),
 				fast: self.fast,
 				enable_cache: true,
+				num_runs: 3,
+				drop_outliers: true,
+				overlap_threshold: 0.5,
 			},
 			AnalysisConfig
 		)
