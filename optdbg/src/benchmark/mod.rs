@@ -272,6 +272,8 @@ pub struct BenchmarkConfig {
 	pub drop_outliers: bool,
 	/// Standard deviation overlap threshold to consider runtimes equal (0.0-1.0)
 	pub overlap_threshold: f64,
+	/// Whether to skip measuring subplans of failing plans
+	pub early_stopping: bool,
 }
 
 impl Default for BenchmarkConfig {
@@ -283,6 +285,7 @@ impl Default for BenchmarkConfig {
 			num_runs: 3,
 			drop_outliers: false,
 			overlap_threshold: 0.5,
+			early_stopping: true,
 		}
 	}
 }
@@ -399,6 +402,32 @@ async fn measure_subplan(
 		Err(e) => {
 			cards.push(Err(e));
 			times.push(Err(e));
+			
+			// If early stopping is enabled and this plan failed, don't measure children
+			if cfg.early_stopping {
+				println!("Plan failed, skipping subplans due to early stopping");
+				// Fill in errors for all children recursively
+				let mut children_count = 0;
+				
+				// Count all children recursively
+				fn count_children(plan: &Arc<dyn ExecutionPlan>, count: &mut usize) {
+					*count += plan.children().len();
+					for child in plan.children() {
+						count_children(&child, count);
+					}
+				}
+				
+				count_children(&node, &mut children_count);
+				
+				// Fill the arrays with errors for each skipped child
+				for _ in 0..children_count {
+					cards.push(Err(e));
+					times.push(Err(e));
+					*idx += 1; // Increment idx for each skipped child
+				}
+				
+				return Ok(());
+			}
 		}
 	}
 

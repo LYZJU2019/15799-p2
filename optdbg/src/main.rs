@@ -87,6 +87,7 @@ impl Args {
 				num_runs: 3,
 				drop_outliers: true,
 				overlap_threshold: 0.5,
+				early_stopping: true,
 			},
 			AnalysisConfig
 		)
