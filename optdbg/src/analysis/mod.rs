@@ -20,7 +20,7 @@ pub struct Report {
 	pub samples: Vec<MeasuredPlan>,
 	/// Index of chosen plan in `samples` field.
 	pub chosen: usize,
-	pub node_problems: HashMap<usize, HashMap<usize, NodeProblem>>
+	pub node_problems: HashMap<usize, HashMap<usize, Vec<NodeProblem>>>
 }
 
 impl Report {
@@ -101,22 +101,29 @@ impl std::fmt::Display for Report {
 	}
 }
 
+fn add_problem(problems: &mut HashMap<usize, Vec<NodeProblem>>, idx: &usize, problem: NodeProblem) {
+	if let None = problems.get(idx) {
+		problems.insert(*idx, Vec::new());
+	}
+	problems.get_mut(idx).unwrap().push(problem);
+}
+
 fn proc_plan(
 	node: Arc<dyn ExecutionPlan>,
 	node_idx: &mut usize,
 	plan: &MeasuredPlan,
-	problems: &mut HashMap<usize, NodeProblem>
+	problems: &mut HashMap<usize, Vec<NodeProblem>>
 ) {
 	if let Ok(card) = plan.cardinalities[*node_idx] {
 		let est_card = plan.plan.est_cards[*node_idx];
 		let q = calculate_q_error(est_card, card);
 		if CardQuality::from_q_err(q) == CardQuality::Poor {
-			problems.insert(*node_idx, NodeProblem::CardinalityMisestimation(
+			add_problem(problems, &node_idx, NodeProblem::CardinalityMisestimation(
 				est_card as usize, card, q
 			));
 		}
 	} else if let Err(MeasureError::Died) = plan.cardinalities[*node_idx] {
-		problems.insert(*node_idx, NodeProblem::Crash);
+		add_problem(problems, &node_idx, NodeProblem::Crash);
 	}
 		
 	for c in node.children() {
@@ -141,26 +148,41 @@ pub fn analyze(bench: BenchmarkOutput, _cfg: AnalysisConfig) -> Report {
 		problems.insert(i, plan_problems);
 	}
 
-	// for (i, plan) in bench.plans.iter().enumerate() {
-	// 	let sz = plan.plan.size();
-	// 	for n_i in 0..sz {
-	// 		let mut est_rank = 0;
-	// 		let mut real_rank = 0;
-	// 		for (j, oplan) in bench.plans.iter().enumerate() {
-	// 			if i == j { continue } 
-	// 			if partial_eq_plans(plan.plan.tree.clone(), oplan.plan.tree.clone(), n_i) {
-	// 				if oplan.plan.est_costs[n_i] < plan.plan.est_costs[n_i] {
-	// 					est_rank += 1;
-	// 				}
-	// 				if oplan.sub_runtimes.as_ref().unwrap()[n_i].unwrap() <
-	// 					plan.sub_runtimes.as_ref().unwrap()[n_i].unwrap()
-	// 				{
-	// 					real_rank += 1;
-	// 				}
-	// 			}
-	// 		}
-	// 	}
-	// }
+	for (i, plan) in bench.plans.iter().enumerate() {
+		let sz = plan.plan.size();
+		let plan_problems = problems.get_mut(&i).unwrap();
+		for n_i in 0..sz {
+			let Ok(runtime) = plan.sub_runtimes.as_ref().unwrap()[n_i] else {
+				continue
+			};
+			let mut est_rank = 0;
+			let mut real_rank = 0;
+			for (j, oplan) in bench.plans.iter().enumerate() {
+				if i == j { continue }
+				println!("{i} {n_i} vs. {j}");
+				if partial_eq_plans(plan.plan.tree.clone(), oplan.plan.tree.clone(), n_i) {
+					println!("{i} {n_i} considering other candidate");
+					let Ok(oruntime) = oplan.sub_runtimes.as_ref().unwrap()[n_i] else {
+						continue
+					};
+					if oplan.plan.est_costs[n_i] < plan.plan.est_costs[n_i] {
+						est_rank += 1;
+					}
+					if oruntime < runtime
+					{
+						real_rank += 1;
+					}
+				}
+			}
+			if est_rank != real_rank {
+				add_problem(plan_problems, &n_i, NodeProblem::CostMisestimation(
+					plan.plan.est_costs[n_i],
+					est_rank,
+					real_rank,
+				));
+			}
+		}
+	}
 	
 	Report {
 		metrics: bench.metrics,

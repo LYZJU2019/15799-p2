@@ -50,18 +50,14 @@ fn partial_eq_plans_help(
         return false;
     }
 
-    if !eq_properties(a.properties(), b.properties()) {
-        return false;
-    }
-
     let a_childs = a.children();
     let b_childs = b.children();
     if a_childs.len() != b_childs.len() {
         return false;
     }
-    for (i, j) in a_childs.into_iter().zip(b_childs.into_iter()) {
+    for (i, j) in a_childs.into_iter().zip(b_childs.into_iter()) {		
 		*cur += 1;
-        if !eq_plans(i.clone(), j.clone()) {
+        if !partial_eq_plans_help(i.clone(), j.clone(), cur, target_i) {
             return false;
         }
     }
