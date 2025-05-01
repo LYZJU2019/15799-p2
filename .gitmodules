@@ -16,3 +16,6 @@
 [submodule "optdbg/optd-original"]
 	path = optdbg/optd-original
 	url = git@github.com:quantumish/optd-original.git
+[submodule "integration-tests/make_parquet/arrow-tools"]
+	path = integration-tests/make_parquet/arrow-tools
+	url = git@github.com:quantumish/arrow-tools.git

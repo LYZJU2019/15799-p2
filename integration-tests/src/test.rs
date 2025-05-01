@@ -59,6 +59,7 @@ async fn main() -> anyhow::Result<()> {
 			};
 			
 			let file_path = path_entry.path();
+			println!("{}", file_path.display());
 			
 			// Read as bytes first, then handle UTF-8 conversion
 			let sql_bytes = match std::fs::read(&file_path) {
@@ -98,7 +99,12 @@ async fn main() -> anyhow::Result<()> {
 				tables,
 			})
 		}
-	}).filter_map(|x: anyhow::Result<QueryInfo>| async { x.ok() });
+	}).filter_map(|x: anyhow::Result<QueryInfo>| async {
+		if let Err(ref e) = x {
+			println!("{e}");
+		}
+		x.ok()
+	});
 	
 	let report = optdbg::report_query(stream, s_cfg, b_cfg, a_cfg).await?;
 	println!("{report}");
