@@ -28,6 +28,7 @@ use optd_og_core::cost::Cost;
 use optd_og_core::nodes::{PlanNode, PlanNodeMeta, PlanNodeMetaMap, PlanNodeOrGroup};
 use optd_og_core::{
     cascades::{CascadesOptimizer as OptdCascadesOptimizer, Memo},
+    nodes::NodeType,
     rules::Rule,
 };
 use optd_og_datafusion_bridge::{DatafusionCatalog, OptdDfContext, OptdPlanContext};
@@ -287,47 +288,63 @@ impl OptdOldBackend {
     fn get_alts_help(
         opt: &DatafusionOptimizer,
         gid: GroupId,
-        visited: &mut HashSet<ExprId>,
+        visited: &mut HashMap<GroupId, HashSet<ExprId>>,
         fake_meta: &mut PlanNodeMetaMap,
         physical_expr_count: &mut HashMap<GroupId, usize>,
+        node_group_map: &mut HashMap<usize, GroupId>,
     ) -> Vec<ArcDfPlanNode> {
         let mut out = Vec::new();
         let exprs = &opt.cascades_optimizer.memo.get_group(gid).group_exprs;
 
+        // one visited per GroupId, still one alternative
+        if !visited.contains_key(&gid) {
+            visited.insert(gid, HashSet::new());
+        }
+
         // println!("Group {gid} has {} expressions", exprs.len());
         let mut physical_cnt = 0;
         for expr_id in exprs {
-            if visited.contains(expr_id) {
+            let visited_gid = visited.get_mut(&gid).unwrap();
+            if visited_gid.contains(expr_id) {
                 continue;
             }
-            visited.insert(*expr_id);
+            visited_gid.insert(*expr_id);
             let expr = opt.cascades_optimizer.memo.get_expr_memoed(*expr_id);
-            if !matches!(
-                expr.typ,
-                DfNodeType::PhysicalAgg
-                    | DfNodeType::PhysicalEmptyRelation
-                    | DfNodeType::PhysicalProjection
-                    | DfNodeType::PhysicalScan
-                    | DfNodeType::PhysicalFilter
-                    | DfNodeType::PhysicalSort
-                    | DfNodeType::PhysicalNestedLoopJoin(_)
-                    | DfNodeType::PhysicalHashJoin(_)
-                    | DfNodeType::PhysicalLimit
-            ) {
+            // if !matches!(
+            //     expr.typ,
+            //     DfNodeType::PhysicalAgg
+            //         | DfNodeType::PhysicalEmptyRelation
+            //         | DfNodeType::PhysicalProjection
+            //         | DfNodeType::PhysicalScan
+            //         | DfNodeType::PhysicalFilter
+            //         | DfNodeType::PhysicalSort
+            //         | DfNodeType::PhysicalNestedLoopJoin(_)
+            //         | DfNodeType::PhysicalHashJoin(_)
+            //         | DfNodeType::PhysicalLimit
+            // ) {
+            //     continue;
+            // }
+            if expr.typ.is_logical() {
                 continue;
             }
             physical_cnt += 1;
             let mut children: Vec<Vec<ArcDfPlanNode>> = Vec::with_capacity(expr.children.len());
             for child in &expr.children {
                 // println!("Expr w/ id {expr_id} (aka {}) is has child in group {child}", expr.typ)
-                let child_alts =
-                    Self::get_alts_help(opt, *child, visited, fake_meta, physical_expr_count);
+                let child_alts = Self::get_alts_help(
+                    opt,
+                    *child,
+                    visited,
+                    fake_meta,
+                    physical_expr_count,
+                    node_group_map,
+                );
                 children.push(child_alts);
                 // println!("Child group {child} has {} alternatives", len);
             }
 
             if children.is_empty() {
-                out.push(Arc::new(optd_og_core::nodes::PlanNode {
+                let thing = Arc::new(optd_og_core::nodes::PlanNode {
                     typ: expr.typ.clone(),
                     children: vec![],
                     predicates: expr
@@ -335,7 +352,9 @@ impl OptdOldBackend {
                         .iter()
                         .map(|x| opt.cascades_optimizer.memo.get_pred(*x))
                         .collect(),
-                }));
+                });
+                node_group_map.insert(Arc::as_ptr(&thing) as usize, gid);
+                out.push(thing);
             } else {
                 let iter = children.iter().multi_cartesian_product();
                 for children in iter {
@@ -352,11 +371,16 @@ impl OptdOldBackend {
                             .map(|x| opt.cascades_optimizer.memo.get_pred(*x))
                             .collect(),
                     });
-                    // PUSH CHILDREN INTO META
-                    Self::insert_with_children(&thing, gid, fake_meta);
+
+                    node_group_map.insert(Arc::as_ptr(&thing) as usize, gid);
                     out.push(thing.clone());
                 }
             }
+        }
+
+        // PUSH CHILDREN INTO META
+        for node in &out {
+            Self::insert_with_children(node, fake_meta, &node_group_map);
         }
 
         physical_expr_count
@@ -370,13 +394,21 @@ impl OptdOldBackend {
 
     fn insert_with_children(
         node: &Arc<PlanNode<DfNodeType>>,
-        gid: GroupId,
         fake_meta: &mut PlanNodeMetaMap,
+        node_group_map: &HashMap<usize, GroupId>,
     ) {
+        let ptr = Arc::as_ptr(node) as usize;
+        let group_id = *node_group_map.get(&ptr).expect("group ID missing for node");
+
+        let key = node.as_ref() as *const _ as usize;
+        if fake_meta.contains_key(&key) {
+            return; // Already inserted
+        }
+
         fake_meta.insert(
-            node.as_ref() as *const _ as usize,
+            key,
             PlanNodeMeta {
-                group_id: gid,
+                group_id,
                 weighted_cost: 0.0,
                 cost: Cost(vec![]),
                 stat: Arc::new(optd_og_core::cost::Statistics(Box::new(DfStatistics {
@@ -389,7 +421,7 @@ impl OptdOldBackend {
 
         for child in &node.children {
             if let PlanNodeOrGroup::PlanNode(child_node) = child {
-                Self::insert_with_children(child_node, gid, fake_meta);
+                Self::insert_with_children(child_node, fake_meta, node_group_map);
             }
         }
     }
@@ -397,22 +429,36 @@ impl OptdOldBackend {
     async fn get_alts_memo(&mut self, st: &SessionState) -> Result<Vec<Plan>> {
         let opt = self.opt.as_ref().unwrap();
         let (gid, _, _) = self.best_cascades.take().unwrap();
-        let mut set = HashSet::new();
+        let mut set = HashMap::new();
         let mut fake_meta = HashMap::new();
         let mut physical_expr_count = HashMap::new();
-        let plans =
-            Self::get_alts_help(opt, gid, &mut set, &mut fake_meta, &mut physical_expr_count);
+        let mut node_group_map = HashMap::new();
+        let plans = Self::get_alts_help(
+            opt,
+            gid,
+            &mut set,
+            &mut fake_meta,
+            &mut physical_expr_count,
+            &mut node_group_map,
+        );
 
-        // compare physical_expr_count with the number of physical expressions in the memo
-        for (group_id, count) in physical_expr_count {
-            let memo_count = opt
+        for (group_id, counted) in &physical_expr_count {
+            let memo_physical_count = opt
                 .cascades_optimizer
                 .memo
-                .get_group_physical_expr_count(group_id);
+                .get_group(*group_id)
+                .group_exprs
+                .iter()
+                .filter(|eid| {
+                    let expr = opt.cascades_optimizer.memo.get_expr_memoed(**eid);
+                    !expr.typ.is_logical()
+                })
+                .count();
 
-            if count != memo_count {
+            if *counted != memo_physical_count {
                 println!(
-                    "Group {group_id} has {count} physical expressions in the plan, but {memo_count} in the memo"
+                    "Group {group_id} → memo has {memo_physical_count} physical exprs, \
+             but get_alts_help counted {counted}"
                 );
             }
         }
@@ -647,8 +693,8 @@ pub struct SampleConfig;
 
 /// Output of sampler.
 pub struct SampleOutput {
-	pub name: String,
-	/// Plan chosen by the query optimizer.
+    pub name: String,
+    /// Plan chosen by the query optimizer.
     pub best_plan: Plan,
     /// Alternative plans not chosen by the query optimizer.
     pub alternates: Vec<Plan>,
@@ -660,7 +706,7 @@ pub struct SampleOutput {
 
 /// Input to sampler.
 pub struct QueryInfo {
-	pub name: String, 
+    pub name: String,
     /// Logical plan of query to optimize.
     pub plan: LogicalPlan,
     pub tables: Arc<dyn SchemaProvider>,
@@ -669,25 +715,25 @@ pub struct QueryInfo {
 }
 
 pub fn sample(
-	queries: impl Stream<Item = QueryInfo>,
-	_cfg: SampleConfig
+    queries: impl Stream<Item = QueryInfo>,
+    _cfg: SampleConfig,
 ) -> impl Stream<Item = SampleOutput> {
-	queries.then(|mut query| async move {
-		let backend = Arc::get_mut(&mut query.backend).unwrap();
-		let best = backend.get_best(&query.state, query.plan).await?;
-		let alts = backend.get_alternates(&query.state).await?;
-		// let alts = Vec::new();
-		
-		println!("Found {} alternatives", alts.len());
+    queries
+        .then(|mut query| async move {
+            let backend = Arc::get_mut(&mut query.backend).unwrap();
+            let best = backend.get_best(&query.state, query.plan).await?;
+            let alts = backend.get_alternates(&query.state).await?;
+            // let alts = Vec::new();
 
-		Ok(SampleOutput {
-			name: query.name,
-			best_plan: best,
-			alternates: alts,
-			session: query.state,
-			tables: query.tables,
-		})
-	}).filter_map(|x: Result<SampleOutput>| async {
-		x.ok()
-	})
+            println!("Found {} alternatives", alts.len());
+
+            Ok(SampleOutput {
+                name: query.name,
+                best_plan: best,
+                alternates: alts,
+                session: query.state,
+                tables: query.tables,
+            })
+        })
+        .filter_map(|x: Result<SampleOutput>| async { x.ok() })
 }
