@@ -75,35 +75,73 @@ async fn time_subplan(
 	ctx: Arc<TaskContext>,
 	timeout: Option<Duration>,
 ) -> anyhow::Result<Option<(Vec<RecordBatch>, Duration)>> {
+	// Ensure a timeout is set
+	let timeout = timeout.unwrap_or(Duration::from_secs(5));
+	// Calculate hard timeout (1.5 times the original timeout)
+	let hard_timeout = timeout.checked_add(timeout.checked_div(2).unwrap_or(Duration::from_millis(500))).unwrap_or(Duration::from_secs(10));
+	
+	// Start timing
+	let start = Instant::now();
+	
+	// Create two channels for communication
 	let (result_tx, result_rx) = tokio::sync::oneshot::channel();
 	let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
-	if let Some(timeout) = timeout {
-		let (node, ctx) = (node.clone(), ctx.clone());
-		let _ = tokio::task::spawn(async move {
-			let before = Instant::now();
-			let out = collect(node, ctx).await;
-			let after = Instant::now();
-			let _ = result_tx.send((out, after-before));
-		});
-		tokio::spawn(async move {
-			tokio::time::sleep(timeout).await;
-			let _ = cancel_tx.send(());
-		});
-		tokio::select! {
-			result = result_rx => {
-				let (res, time) = result?;
-				Ok(Some((res?, time)))
+	
+	// Start execution task
+	let handle = tokio::spawn(async move {
+		// Catch potential panics
+		let result = match tokio::task::spawn(async {
+			collect(node, ctx).await
+		}).await {
+			Ok(res) => res,
+			Err(e) => {
+				println!("Worker thread panicked: {}", e);
+				Err(datafusion::error::DataFusionError::Execution("Panic occurred during query execution".to_string()))
 			}
-			_ = cancel_rx => {
-				Ok(None)
+		};
+		
+		// Send result (success or error)
+		let elapsed = start.elapsed();
+		let _ = result_tx.send((result, elapsed));
+	});
+	
+	// Start timeout task
+	tokio::spawn(async move {
+		tokio::time::sleep(timeout).await;
+		let _ = cancel_tx.send(());
+	});
+	
+	// Wait for result or timeout
+	tokio::select! {
+		result = result_rx => {
+			match result {
+				Ok((res, time)) => {
+					println!("Query completed in {:?}", time);
+					match res {
+						Ok(data) => Ok(Some((data, time))),
+						Err(e) => {
+							println!("Error during execution: {}", e);
+							Ok(None)
+						}
+					}
+				},
+				Err(e) => {
+					println!("Channel closed unexpectedly: {}", e);
+					Ok(None)
+				}
 			}
+		},
+		_ = cancel_rx => {
+			println!("Timeout reached, cancelling task");
+			handle.abort();
+			Ok(None)
+		},
+		// Hard timeout to ensure no indefinite waiting
+		_ = tokio::time::sleep(hard_timeout) => {
+			println!("Hard timeout reached");
+			handle.abort();
+			Ok(None)
 		}
-	} else {
-		let (node, ctx) = (node.clone(), ctx.clone());
-		let before = Instant::now();
-		let out = collect(node, ctx).await;
-		let after = Instant::now();
-		Ok(Some((out?, after-before)))
 	}
 }
 
@@ -123,14 +161,7 @@ async fn measure_subplan(
 	cards: &mut Vec<Result<usize, MeasureError>>,
 	times: &mut Vec<Result<Duration, MeasureError>>,
 ) -> anyhow::Result<()> {
-	// First collect all children's cardinalities
-	let mut child_cards = Vec::new();
-	let mut child_times = Vec::new();
-	for child in node.children() {
-		measure_subplan(child.clone(), ctx.clone(), cfg, &mut child_cards, &mut child_times).await?;
-	}
-
-	// Then process the current node
+	// First execute the current node
 	if let Some((batches, time)) = time_subplan(node.clone(), ctx.clone(), cfg.timeout).await? {
 		println!("\n=== Plan Execution Details ===");
 		println!("Number of batches received: {}", batches.len());
@@ -141,22 +172,39 @@ async fn measure_subplan(
 		println!("Total cardinality: {}", cardinality);
 		println!("Execution time: {:?}", time);
 		println!("============================\n");
-
-		// Push all children's results first
-		cards.extend(child_cards);
-		times.extend(child_times);
 		
-		// Then push current node's result
-		cards.push(Ok(batches.iter().map(|x| x.num_rows()).sum::<usize>()));
+		// Push current node's result
+		cards.push(Ok(cardinality));
 		times.push(Ok(time));
-	} else {
-		// Push all children's results first
-		cards.extend(child_cards);
-		times.extend(child_times);
 		
-		// Then push current node's timeout
+		// If current node executed successfully, then process its children
+		for i in 0..node.children().len() {
+			let child = node.children()[i].clone();
+			measure_subplan(child, ctx.clone(), cfg, cards, times).await?;
+		}
+	} else {
+		// Current node timed out, no need to process children
 		cards.push(Err(MeasureError::Timeout));
 		times.push(Err(MeasureError::Timeout));
+		
+		// Use a non-recursive approach to mark all descendants as errors
+		// First, add all immediate children to our stack
+		let mut stack = Vec::new();
+		for i in 0..node.children().len() {
+			stack.push(node.children()[i].clone());
+		}
+		
+		// Process the stack until empty
+		while let Some(child_node) = stack.pop() {
+			// Mark this node as timeout error
+			cards.push(Err(MeasureError::Timeout));
+			times.push(Err(MeasureError::Timeout));
+			
+			// Add its children to the stack
+			for i in 0..child_node.children().len() {
+				stack.push(child_node.children()[i].clone());
+			}
+		}
 	}
 	Ok(())
 }
