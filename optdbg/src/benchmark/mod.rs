@@ -344,7 +344,7 @@ fn calculate_cost_rank_accuracy(plans: &[MeasuredPlan]) -> (f64, f64) {
 /// Calculates Q-Error between estimated and actual cardinality
 /// Q-Error is defined as max(est/act, act/est) and is always >= 1.0
 /// A Q-Error of 1.0 means perfect estimation
-fn calculate_q_error(estimated: f64, actual: usize) -> f64 {
+pub fn calculate_q_error(estimated: f64, actual: usize) -> f64 {
 	if estimated == 0.0 && actual == 0 {
 		return 1.0; // Perfect estimation
 	}
@@ -430,6 +430,31 @@ fn calculate_performance_factor(plans: &[MeasuredPlan], chosen_idx: usize) -> f6
 	plans_worse_or_equal as f64 / valid_plans as f64
 }
 
+#[derive(PartialEq, Eq)]
+pub enum CardQuality {
+	Excellent,
+	Good,
+	Acceptable,
+	Poor,
+	Unknown
+}
+
+impl CardQuality {
+	pub fn from_q_err(q: f64) -> Self {
+		if !q.is_finite() {
+			Self::Unknown
+		} else if q <= 2.0 {
+			Self::Excellent
+		} else if q <= 4.0 {
+			Self::Good
+		} else if q <= 10.0 {
+			Self::Acceptable
+		} else {
+			Self::Poor
+		} 
+	}
+}
+
 pub async fn benchmark(
 	sample: SampleOutput,
 	cfg: BenchmarkConfig
@@ -470,17 +495,18 @@ pub async fn benchmark(
 	// Print Q-Error analysis
 	println!("\nCardinality Estimation Q-Error Analysis (only best plan):");
 	println!("Average Q-Error: {:.2} (closer to 1.0 is better)", avg_q_error);
-	
-	if avg_q_error.is_finite() && avg_q_error <= 2.0 {
-		println!("Cardinality estimation is excellent (avg Q-Error ≤ 2.0)");
-	} else if avg_q_error.is_finite() && avg_q_error <= 4.0 {
-		println!("Cardinality estimation is good (avg Q-Error ≤ 4.0)");
-	} else if avg_q_error.is_finite() && avg_q_error <= 10.0 {
-		println!("Cardinality estimation is acceptable (avg Q-Error ≤ 10.0)");
-	} else if avg_q_error.is_finite() {
-		println!("Cardinality estimation needs improvement (avg Q-Error > 10.0)");
-	} else {
-		println!("Cardinality estimation cannot be evaluated");
+
+	match CardQuality::from_q_err(avg_q_error) {
+		CardQuality::Excellent =>
+			println!("Cardinality estimation is excellent (avg Q-Error ≤ 2.0)"),
+		CardQuality::Good =>
+			println!("Cardinality estimation is good (avg Q-Error ≤ 4.0)"),
+		CardQuality::Acceptable =>
+			println!("Cardinality estimation is acceptable (avg Q-Error ≤ 10.0)"),
+		CardQuality::Poor => 
+			println!("Cardinality estimation needs improvement (avg Q-Error > 10.0)"),
+		CardQuality::Unknown => 
+			println!("Cardinality estimation cannot be evaluated"),
 	}
 	
 	Ok(BenchmarkOutput {
