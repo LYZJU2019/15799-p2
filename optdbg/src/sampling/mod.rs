@@ -23,7 +23,7 @@ use dolomite::optimizer::Optimizer;
 use itertools::Itertools;
 use optd_og_core::cascades::{ExprId, GroupId};
 use optd_og_core::cost::Cost;
-use optd_og_core::nodes::{PlanNodeMeta, PlanNodeMetaMap, PlanNodeOrGroup};
+use optd_og_core::nodes::{PlanNode, PlanNodeMeta, PlanNodeMetaMap, PlanNodeOrGroup};
 use optd_og_core::{
     cascades::{CascadesOptimizer as OptdCascadesOptimizer, Memo},
     rules::Rule,
@@ -32,7 +32,7 @@ use optd_og_datafusion_bridge::{DatafusionCatalog, OptdDfContext, OptdPlanContex
 use optd_og_datafusion_repr::DatafusionOptimizer;
 use optd_og_datafusion_repr::cost::COMPUTE_COST;
 use optd_og_datafusion_repr::cost::base_cost::DfStatistics;
-use optd_og_datafusion_repr::plan_nodes::{ArcDfPlanNode, DfNodeType, DfPlanNode};
+use optd_og_datafusion_repr::plan_nodes::{ArcDfPlanNode, DfNodeType};
 use optd_og_datafusion_repr::rules;
 use optd_og_datafusion_repr_adv_cost::adv_stats::stats::DataFusionBaseTableStats;
 use optd_og_datafusion_repr_adv_cost::adv_stats::stats::DataFusionPerTableStats;
@@ -343,24 +343,39 @@ impl OptdOldBackend {
                             .map(|x| opt.cascades_optimizer.memo.get_pred(*x))
                             .collect(),
                     });
-                    fake_meta.insert(
-                        thing.as_ref() as *const _ as usize,
-                        PlanNodeMeta {
-                            group_id: gid,
-                            weighted_cost: 0.0,
-                            cost: Cost(vec![]),
-                            stat: Arc::new(optd_og_core::cost::Statistics(Box::new(
-                                DfStatistics { row_cnt: 0.0 },
-                            ))),
-                            cost_display: "".to_string(),
-                            stat_display: "".to_string(),
-                        },
-                    );
+                    // PUSH CHILDREN INTO META
+                    Self::insert_with_children(&thing, gid, fake_meta);
                     out.push(thing.clone());
                 }
             }
         }
         out
+    }
+
+    fn insert_with_children(
+        node: &Arc<PlanNode<DfNodeType>>,
+        gid: GroupId,
+        fake_meta: &mut PlanNodeMetaMap,
+    ) {
+        fake_meta.insert(
+            node.as_ref() as *const _ as usize,
+            PlanNodeMeta {
+                group_id: gid,
+                weighted_cost: 0.0,
+                cost: Cost(vec![]),
+                stat: Arc::new(optd_og_core::cost::Statistics(Box::new(DfStatistics {
+                    row_cnt: 0.0,
+                }))),
+                cost_display: "".to_string(),
+                stat_display: "".to_string(),
+            },
+        );
+
+        for child in &node.children {
+            if let PlanNodeOrGroup::PlanNode(child_node) = child {
+                Self::insert_with_children(child_node, gid, fake_meta);
+            }
+        }
     }
 
     async fn get_alts_memo(&mut self, st: &SessionState) -> Result<Vec<Plan>> {
@@ -450,8 +465,8 @@ impl OptdOldBackend {
             // NOTE: this blocks all println! calls! remember me when debugging!!
             let gag = gag::Gag::stdout().unwrap();
 
-			// Rebuilding optimizer is probably not necessary but it was
-			// the first thing that started working.
+            // Rebuilding optimizer is probably not necessary but it was
+            // the first thing that started working.
             let mut opt = if let Some(stats) = &self.stats {
                 new_physical_adv_cost(catalog.clone(), stats.clone(), false)
             } else {
