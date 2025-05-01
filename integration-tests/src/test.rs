@@ -18,6 +18,30 @@ async fn main() -> anyhow::Result<()> {
     // 	.with_max_level(tracing::Level::DEBUG)
     // 	.init();
 
+	let tpch_query_3 = "
+SELECT
+    l_returnflag,
+    l_linestatus,
+    sum(l_quantity) as sum_qty,
+    sum(l_extendedprice) as sum_base_price,
+    sum(l_extendedprice * (1.0 - l_discount)) as sum_disc_price,
+    sum(l_extendedprice * (1.0 - l_discount) * (1.0 + l_tax)) as sum_charge,
+    avg(l_quantity) as avg_qty,
+    avg(l_extendedprice) as avg_price,
+    avg(l_discount) as avg_disc,
+    count(*) as count_order
+FROM
+    lineitem
+WHERE
+    l_shipdate <= date '1998-09-01' - interval '90' day
+GROUP BY
+    l_returnflag,
+    l_linestatus
+ORDER BY
+    l_returnflag,
+    l_linestatus;
+";
+	
     let tpch_query_9 = "
 select
 	nation,
@@ -41,7 +65,7 @@ from
 			and p_partkey = l_partkey
 			and o_orderkey = l_orderkey
 			and s_nationkey = n_nationkey
-			and p_name like '%:1%'
+			and p_name like '%green%'
 	) as profit
 group by
 	nation
@@ -62,7 +86,7 @@ AND c_mktsegment = 'AUTOMOBILE'
     let s_cfg = SampleConfig;
 
     let b_cfg = BenchmarkConfig {
-        timeout: Some(std::time::Duration::from_secs(10)),
+        timeout: Some(std::time::Duration::from_secs(30)),
         fast: false,
     };
 
@@ -104,7 +128,7 @@ AND c_mktsegment = 'AUTOMOBILE'
         tables,
     };
 
-    optdbg::report_query(query, s_cfg, b_cfg, a_cfg).await?;
+    println!("{}", optdbg::report_query(query, s_cfg, b_cfg, a_cfg).await?);
 
     Ok(())
 }

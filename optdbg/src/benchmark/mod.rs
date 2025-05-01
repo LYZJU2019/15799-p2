@@ -333,9 +333,6 @@ fn calculate_cost_rank_accuracy(plans: &[MeasuredPlan]) -> (f64, f64) {
 	
 	// Calculate percentage accuracy (0-100, higher is better)
 	let accuracy_percent = 100.0 * (-s.abs()).exp();
-
-	println!("TAQO Score (s): {:.4} (lower is better)", s);
-	println!("TAQO Accuracy: {:.2}% (higher is better)", accuracy_percent);
 	
 	// Return the raw score 's' and the percentage accuracy
 	(s, accuracy_percent)
@@ -491,23 +488,6 @@ pub async fn benchmark(
 	
 	// Calculate average Q-Error for the chosen plan
 	let avg_q_error = calculate_avg_q_error(&out[chosen_idx]);
-	
-	// Print Q-Error analysis
-	println!("\nCardinality Estimation Q-Error Analysis (only best plan):");
-	println!("Average Q-Error: {:.2} (closer to 1.0 is better)", avg_q_error);
-
-	match CardQuality::from_q_err(avg_q_error) {
-		CardQuality::Excellent =>
-			println!("Cardinality estimation is excellent (avg Q-Error ≤ 2.0)"),
-		CardQuality::Good =>
-			println!("Cardinality estimation is good (avg Q-Error ≤ 4.0)"),
-		CardQuality::Acceptable =>
-			println!("Cardinality estimation is acceptable (avg Q-Error ≤ 10.0)"),
-		CardQuality::Poor => 
-			println!("Cardinality estimation needs improvement (avg Q-Error > 10.0)"),
-		CardQuality::Unknown => 
-			println!("Cardinality estimation cannot be evaluated"),
-	}
 	
 	Ok(BenchmarkOutput {
 		plans: out,

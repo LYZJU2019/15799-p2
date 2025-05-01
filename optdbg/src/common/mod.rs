@@ -33,6 +33,52 @@ fn eq_plans(a: Arc<dyn ExecutionPlan>, b: Arc<dyn ExecutionPlan>) -> bool {
     true
 }
 
+fn partial_eq_plans_help(
+	a: Arc<dyn ExecutionPlan>,
+	b: Arc<dyn ExecutionPlan>,
+	cur: &mut usize,
+	target_i: usize
+) -> bool {
+	if *cur == target_i {
+		return true;
+	}	
+    if a.name() != b.name() {
+        return false;
+    }
+
+    if a.as_any().type_id() != b.as_any().type_id() {
+        return false;
+    }
+
+    if !eq_properties(a.properties(), b.properties()) {
+        return false;
+    }
+
+    let a_childs = a.children();
+    let b_childs = b.children();
+    if a_childs.len() != b_childs.len() {
+        return false;
+    }
+    for (i, j) in a_childs.into_iter().zip(b_childs.into_iter()) {
+		*cur += 1;
+        if !eq_plans(i.clone(), j.clone()) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Compares plan `a` to `b`, assuming that the node at preorder index `i` of `a`
+/// is equal to any node of b at the same position.
+pub fn partial_eq_plans(
+	a: Arc<dyn ExecutionPlan>,
+	b: Arc<dyn ExecutionPlan>,
+	target_i: usize
+) -> bool {
+	let mut cur = 0;
+	partial_eq_plans_help(a, b, &mut cur, target_i)
+}
+
 // TODO: not a complete comparison
 fn eq_properties(prop_a: &PlanProperties, prop_b: &PlanProperties) -> bool {
     prop_a.boundedness == prop_b.boundedness
