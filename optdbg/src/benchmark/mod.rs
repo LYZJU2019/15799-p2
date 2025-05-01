@@ -13,7 +13,7 @@ use futures::{Stream, StreamExt};
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use async_recursion::async_recursion;
-use child_wait_timeout::ChildWT;
+use wait_timeout::ChildExt;
 
 use crate::sampling::SampleOutput;
 use crate::common::{dump_plan, MeasureError, Plan, PlanMeasurements};
@@ -595,6 +595,10 @@ async fn run_plan_ipc(
 	let mut plan_file = tempfile::NamedTempFile::new()?;
 	plan_file.write_all(&bytes)?;
 
+	let bytes = serde_json::to_string(cfg)?;
+	let mut cfg_file = tempfile::NamedTempFile::new()?;
+	cfg_file.write_all(bytes.as_bytes())?;
+
 	let mut schemas = Vec::new();
 	for i in tables.table_names() {
 		schemas.push((i.clone(), tables.table(&i).await?.unwrap().schema()));
@@ -608,24 +612,39 @@ async fn run_plan_ipc(
 
 	let mut child = std::process::Command::new("../optdbg/target/release/runner")
 		.arg("-p").arg(plan_file.path())
+		.arg("-c").arg(cfg_file.path())
 		.arg("-s").arg(schema_file.path())
-		.arg("-o").arg(out_file.path()).spawn()?;
+		.arg("-o").arg(out_file.path())
+		.spawn()?;
 
+	// Universal timeout handling with wait-timeout
 	let status = if let Some(timeout) = cfg.timeout {
-		child.wait_timeout(timeout)
-	} else { child.wait() };
+		match child.wait_timeout(timeout)? {
+			Some(status) => Ok(status),
+			None => {
+				// Child hasn't exited yet, kill it and mark as timeout
+				let _ = child.kill();
+				let _ = child.wait();
+				Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "process timed out"))
+			}
+		}
+	} else {
+		child.wait()
+	};
 
 	match status {
 		Ok(status) => {
 			if !status.success() {
 				Ok(Err(MeasureError::Died))
 			} else {
-				let res: (usize, Duration) = serde_json::from_reader(out_file)?;
-				Ok(Ok(res))
+				match serde_json::from_reader(out_file) {
+					Ok(res) => Ok(Ok(res)),
+					Err(_) => Ok(Err(MeasureError::Timeout))
+				}
 			}
 		},
 		Err(e) if e.kind() == std::io::ErrorKind::TimedOut => Ok(Err(MeasureError::Timeout)),
-		Err(e) => Err(anyhow::anyhow!("subprocess error: {e}"))
+		Err(e) => Err(anyhow::anyhow!("subprocess error: {}", e))
 	}
 }
 
