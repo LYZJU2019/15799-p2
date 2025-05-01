@@ -22,7 +22,7 @@ async fn time_subplan(
 	node: Arc<dyn ExecutionPlan>,
 	ctx: Arc<TaskContext>,
 	timeout: Option<Duration>,
-) -> anyhow::Result<Option<(Vec<RecordBatch>, Duration)>> {
+) -> anyhow::Result<Option<(usize, Duration)>> {
 	let (result_tx, result_rx) = tokio::sync::oneshot::channel();
 	let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
 	if let Some(timeout) = timeout {
@@ -40,7 +40,8 @@ async fn time_subplan(
 		tokio::select! {
 			result = result_rx => {
 				let (res, time) = result?;
-				Ok(Some((res?, time)))
+				let res = res?.iter().map(|x| x.num_rows()).sum();
+				Ok(Some((res, time)))
 			}
 			_ = cancel_rx => {
 				Ok(None)
@@ -51,38 +52,45 @@ async fn time_subplan(
 		let before = Instant::now();
 		let out = collect(node, ctx).await;
 		let after = Instant::now();
-		Ok(Some((out?, after-before)))
+		let res = out?.iter().map(|x| x.num_rows()).sum();
+		Ok(Some((res, after-before)))
 	}
 }
 
-/// Recursively populate cardinality and runtime arrays.
-// TODO need to be a *lot* more rigorous for the actual benchmarking here.
-// one option is to try and integrate an existing optimizer like criterion
-// or divan. Both of these don't really support usage as a library though...
-// Doing this properly is an easy way to surpass TAQO.
-//
-// The other major TODO (this is long term) is to support the `fast` option 
-// and implement the optimization in www.vldb.org/pvldb/vol2/vldb09-294.pdf
-#[async_recursion]
-async fn measure_subplan(
-	node: Arc<dyn ExecutionPlan>,
-	ctx: Arc<TaskContext>,
-	cfg: &BenchmarkConfig,
-	cards: &mut Vec<Result<usize, MeasureError>>,
-	times: &mut Vec<Result<Duration, MeasureError>>,
-) -> anyhow::Result<()> {
-	if let Some((batches, time)) = time_subplan(node.clone(), ctx.clone(), cfg.timeout).await? {
-		cards.push(Ok(batches.iter().map(|x| x.num_rows()).sum()));
-		times.push(Ok(time));
-	} else {
-		cards.push(Err(MeasureError::Timeout));
-		times.push(Err(MeasureError::Timeout));
-	}
-	for child in node.children() {
-		measure_subplan(child.clone(), ctx.clone(), cfg, cards, times).await?;
-	}
-	Ok(())
-}
+// /// Recursively populate cardinality and runtime arrays.
+// // TODO need to be a *lot* more rigorous for the actual benchmarking here.
+// // one option is to try and integrate an existing optimizer like criterion
+// // or divan. Both of these don't really support usage as a library though...
+// // Doing this properly is an easy way to surpass TAQO.
+// //
+// // The other major TODO (this is long term) is to support the `fast` option 
+// // and implement the optimization in www.vldb.org/pvldb/vol2/vldb09-294.pdf
+// #[async_recursion]
+// async fn measure_subplan(
+// 	node: Arc<dyn ExecutionPlan>,
+// 	ctx: Arc<TaskContext>,
+// 	cfg: &BenchmarkConfig,
+// 	cards: &mut Vec<Result<usize, MeasureError>>,
+// 	times: &mut Vec<Result<Duration, MeasureError>>,
+// ) -> anyhow::Result<()> {
+// 	println!("Timing subplan");
+// 	optdbg::common::dump_plan(node.clone(), 0);	
+// 	if let Some((batches, time)) = time_subplan(node.clone(), ctx.clone(), cfg.timeout).await? {
+// 		cards.push(Ok(batches.iter().map(|x| {
+// 			x.num_rows()
+// 		}).sum()));
+// 		println!("got {} and putting result into index {}",
+// 				 time.as_millis(), times.len());
+// 		times.push(Ok(time));
+// 	} else {
+// 		cards.push(Err(MeasureError::Timeout));
+// 		times.push(Err(MeasureError::Timeout));
+// 	}
+// 	for child in node.children() {
+// 		measure_subplan(child.clone(), ctx.clone(), cfg, cards, times).await?;
+// 	}
+// 	Ok(())
+// }
 
 
 /// Benchmark runner.
@@ -131,20 +139,9 @@ async fn main() -> anyhow::Result<()> {
 
 	let plan_bytes = std::fs::read(Path::new(&args.plan_path))?;
 	let plan = physical_plan_from_bytes(&plan_bytes, &df_ctx)?;
-	let mut cards = Vec::new();
-	let mut times = Vec::new();
-	measure_subplan(plan, df_ctx.task_ctx(), &cfg, &mut cards, &mut times).await?;
-	if let Ok(time) = times[0] {
-		println!("got time {}ms", time.as_millis());
-	} else {
-		println!("timed out!");
-	}
-	
-	let measures = PlanMeasurements {
-		cardinalities: cards,
-		sub_runtimes: Some(times),
-	};
-	let serialized = serde_json::to_string(&measures)?;
+	let res = time_subplan(plan, df_ctx.task_ctx(), cfg.timeout).await?;
+		
+	let serialized = serde_json::to_string(&res)?;
 	std::fs::write(&args.output_path, &serialized)?;
 	
 	Ok(())

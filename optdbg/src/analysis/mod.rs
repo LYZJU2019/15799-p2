@@ -13,10 +13,20 @@ pub struct AnalysisConfig;
 pub enum NodeProblem {
 	Crash,
 	CardinalityMisestimation(usize, usize, f64),
-	CostMisestimation(f64, usize, usize),
+	CostMisestimation(u128, f64, usize, usize),
 }
 
 pub struct Report {
+	/// Optimality Frequency (OF) - fraction of queries for which the optimizer chooses the relative optimal plan
+	pub opt_freq: f64,
+	pub avg_taqo_score: f64,
+	pub avg_taqo_acc: f64,
+	pub avg_perf_factor: f64,
+	pub queries: Vec<QueryReport>,
+}
+
+pub struct QueryReport {
+	pub optimal_chosen: bool,
 	pub name: String,
 	pub metrics: OptimizerMetrics,
 	pub samples: Vec<MeasuredPlan>,
@@ -25,7 +35,7 @@ pub struct Report {
 	pub node_problems: HashMap<usize, HashMap<usize, Vec<NodeProblem>>>
 }
 
-impl Report {
+impl QueryReport {
 	fn dump_plan_help(
 		&self,
 		f: &mut std::fmt::Formatter<'_>,
@@ -70,15 +80,40 @@ impl Report {
 	}
 }
 
-impl std::fmt::Display for Report {	
+impl std::fmt::Display for Report {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-		writeln!(f, "{}", self.name)?;
 		writeln!(f, "=================== GLOBAL STATS ===================\n")?;
+		writeln!(f, "Evaluated {} queries.", self.queries.len())?;
+		writeln!(f, "Optimality Frequency (OF): {:.2} (higher is better)", self.opt_freq * 100.0)?;
+		writeln!(f, "Average TAQO Score (s): {:.4} (lower is better)", self.avg_taqo_score)?;
+		writeln!(f, "Average TAQO Accuracy: {:.2}% (higher is better)", self.avg_taqo_acc)?;
+		writeln!(f, "Average Performance Factor (PF): {:.2}%", self.avg_perf_factor * 100.0)?;
+		writeln!(f, "\n====================================================\n\n")?;
+		for q in &self.queries {
+			writeln!(f, "{q}")?;
+		}
+		Ok(())
+	}
+}
+
+impl std::fmt::Display for QueryReport {	
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		use asciigraph::*;
+		writeln!(f, "------------------- {} -------------------\n", self.name)?;
 		writeln!(f, "Sampled {} plans.", self.samples.len())?;
 		writeln!(f, "TAQO Score (s): {:.4} (lower is better)", self.metrics.taqo_score_s)?;
 		writeln!(f, "TAQO Accuracy: {:.2}% (higher is better)", self.metrics.taqo_accuracy_percent)?;
 		writeln!(f, "Performance Factor (PF): {:.2}%", self.metrics.performance_factor * 100.0)?;
 		writeln!(f, "Average Q-Error: {:.2} (closer to 1.0 is better)", self.metrics.avg_q_error)?;
+
+		let mut perfgraph = Graph::default();
+		let data: Vec<_> = self.samples
+			.iter()
+			.filter_map(|x| x.runtime.ok().map(|y| y.as_millis() as usize))
+			.collect();
+		perfgraph.set_1d_data(&data);
+		writeln!(f, "{perfgraph}")?;
+		
 		writeln!(f, "")?;
 		match CardQuality::from_q_err(self.metrics.avg_q_error) {
 			CardQuality::Excellent =>
@@ -92,7 +127,7 @@ impl std::fmt::Display for Report {
 			CardQuality::Unknown => 
 				writeln!(f, "Cardinality estimation cannot be evaluated"),
 		}?;
-		writeln!(f, "\n====================================================\n")?;
+		writeln!(f, "\n--------------------------------------------------\n")?;
 		
 		for i in 0..self.samples.len() {
 			write!(f, "Plan {i}")?;
@@ -142,8 +177,8 @@ fn proc_plan(
 pub async fn analyze(
 	benches: impl Stream<Item = BenchmarkOutput>,
 	_cfg: AnalysisConfig
-) -> Vec<Report> {
-	benches.then(|bench| async move {	
+) -> Report {
+	let queries: Vec<QueryReport> = benches.then(|bench| async move {	
 		let placement: Vec<_> = bench.plans.iter().enumerate()
 			.sorted_by(|(_, x), (_, y)| x.plan.est_costs[0]
 					   .partial_cmp(&y.plan.est_costs[0]).unwrap())
@@ -152,14 +187,16 @@ pub async fn analyze(
 		for i in &placement {
 			est_ranks[placement[*i]] = *i;
 		}
-		let mut problems = HashMap::new();
-		for (i, plan) in bench.plans.iter().enumerate() {
+		let mut problems = HashMap::new();	
+		
+		for (i, plan) in bench.plans.iter().enumerate() {			
+			println!("perf of plan {i}:\n {plan}");
 			let mut plan_problems = HashMap::new();
 			let mut idx = 0;
 			proc_plan(plan.plan.tree.clone(), &mut idx, plan, &mut plan_problems);
 			problems.insert(i, plan_problems);
 		}
-		
+
 		for (i, plan) in bench.plans.iter().enumerate() {
 			let sz = plan.plan.size();
 			let plan_problems = problems.get_mut(&i).unwrap();
@@ -186,6 +223,7 @@ pub async fn analyze(
 				}
 				if est_rank != real_rank {
 					add_problem(plan_problems, &n_i, NodeProblem::CostMisestimation(
+						runtime.as_millis(),
 						plan.plan.est_costs[n_i],
 						est_rank,
 						real_rank,
@@ -194,14 +232,35 @@ pub async fn analyze(
 			}
 		}
 		
-		Report {
+		QueryReport {
+			optimal_chosen: bench.chosen_idx == 0,
 			name: bench.name,
 			metrics: bench.metrics,
 			samples: bench.plans,
 			chosen: bench.chosen_idx,
 			node_problems: problems,
 		}
-	}).collect().await
+	}).collect().await;
+
+	Report {
+		opt_freq: queries
+			.iter()
+			.map(|q| if q.optimal_chosen { 1.0 } else { 0.0 })
+			.sum::<f64>() / queries.len() as f64,
+		avg_taqo_score: queries
+			.iter()
+			.map(|q| q.metrics.taqo_score_s)
+			.sum::<f64>() / queries.len() as f64,
+		avg_taqo_acc: queries
+			.iter()
+			.map(|q| q.metrics.taqo_accuracy_percent)
+			.sum::<f64>() / queries.len() as f64,
+		avg_perf_factor: queries
+			.iter()
+			.map(|q| q.metrics.performance_factor)
+			.sum::<f64>() / queries.len() as f64,
+		queries,
+	}
 }
 	
 	

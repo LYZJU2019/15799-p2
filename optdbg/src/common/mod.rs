@@ -99,9 +99,23 @@ fn plan_size(a: Arc<dyn ExecutionPlan>) -> usize {
         .sum::<usize>()
 }
 
+/// Displays the name of each node in a plan with tree-style indentation.
+pub fn dump_plan(
+    plan: Arc<dyn ExecutionPlan>,
+    indent_level: usize,
+) {
+    for _ in 0..indent_level {
+        print!("  ");
+    }
+	println!("{}", plan.name());
+    for child in plan.children() {
+        dump_plan(child.clone(), indent_level + 1);
+    }
+}
+
 // generalize at some point.....
 /// Displays the name of each node in a plan with tree-style indentation.
-fn format_plan_with_2preorder_help<T1: std::fmt::Display, T2: std::fmt::Display>(
+pub fn format_plan_with_2preorder_help<T1: std::fmt::Display, T2: std::fmt::Display>(
     f: &mut std::fmt::Formatter<'_>,
     plan: Arc<dyn ExecutionPlan>,
     indent_level: usize,

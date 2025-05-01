@@ -59,7 +59,7 @@ async fn main() -> anyhow::Result<()> {
 					OptdOldBackend::new(
 						tables.clone(),
 						table_paths,
-						SampleStrategy::RuleBased(RuleBailStrategy::Threshold(10)),
+						SampleStrategy::RuleBased(RuleBailStrategy::Never),
 						true,
 					)
 						.await?,
@@ -70,10 +70,8 @@ async fn main() -> anyhow::Result<()> {
 		}
 	}).filter_map(|x: anyhow::Result<QueryInfo>| async { x.ok() });
 	
-	let reports = optdbg::report_query(stream, s_cfg, b_cfg, a_cfg).await?;
-	for report in reports {
-		println!("{report}");
-	}
+	let report = optdbg::report_query(stream, s_cfg, b_cfg, a_cfg).await?;
+	println!("{report}");
 
     Ok(())
 }

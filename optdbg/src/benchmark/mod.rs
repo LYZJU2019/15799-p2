@@ -31,8 +31,6 @@ pub struct OptimizerMetrics {
 	pub performance_factor: f64,
 	/// Average Q-Error for cardinality estimation (closer to 1.0 is better)
 	pub avg_q_error: f64,
-	// /// Optimality Frequency (OF) - fraction of queries for which the optimizer chooses the relative optimal plan
-	// pub optimality_frequency: f64,
 }
 
 pub struct BenchmarkOutput {
@@ -56,6 +54,26 @@ pub struct MeasuredPlan {
 	pub sub_runtimes: Option<Vec<Result<Duration, MeasureError>>>,
 }
 
+
+impl std::fmt::Display for MeasuredPlan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		let times = self.sub_runtimes
+			.as_ref()
+			.unwrap()
+			.iter()
+			.map(|x| x.map(|x| x.as_millis()).unwrap_or(9999999)).collect();
+        let mut i = 0;
+        crate::common::format_plan_with_2preorder_help(
+            f,
+            self.plan.tree.clone(),
+            0,
+            &times,
+            &self.plan.est_costs,
+            &mut i,
+        )
+    }
+}
+
 impl MeasuredPlan {
 	fn new(
 		plan: Plan,
@@ -71,81 +89,146 @@ impl MeasuredPlan {
 	}
 }
 
-/// Times a subplan's execution, giving up after a timeout.
-async fn time_subplan(
-	node: Arc<dyn ExecutionPlan>,
-	ctx: Arc<TaskContext>,
-	timeout: Option<Duration>,
-) -> anyhow::Result<Option<(Vec<RecordBatch>, Duration)>> {
-	// Ensure a timeout is set
-	let timeout = timeout.unwrap_or(Duration::from_secs(5));
-	// Calculate hard timeout (1.5 times the original timeout)
-	let hard_timeout = timeout.checked_add(timeout.checked_div(2).unwrap_or(Duration::from_millis(500))).unwrap_or(Duration::from_secs(10));
+// /// Times a subplan's execution, giving up after a timeout.
+// async fn time_subplan(
+// 	node: Arc<dyn ExecutionPlan>,
+// 	ctx: Arc<TaskContext>,
+// 	timeout: Option<Duration>,
+// ) -> anyhow::Result<Option<(Vec<RecordBatch>, Duration)>> {
+// 	// Ensure a timeout is set
+// 	let timeout = timeout.unwrap_or(Duration::from_secs(5));
+// 	// Calculate hard timeout (1.5 times the original timeout)
+// 	let hard_timeout = timeout.checked_add(timeout.checked_div(2).unwrap_or(Duration::from_millis(500))).unwrap_or(Duration::from_secs(10));
 	
-	// Start timing
-	let start = Instant::now();
+// 	// Start timing
+// 	let start = Instant::now();
 	
-	// Create two channels for communication
-	let (result_tx, result_rx) = tokio::sync::oneshot::channel();
-	let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+// 	// Create two channels for communication
+// 	let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+// 	let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
 	
-	// Start execution task
-	let handle = tokio::spawn(async move {
-		// Catch potential panics
-		let result = match tokio::task::spawn(async {
-			collect(node, ctx).await
-		}).await {
-			Ok(res) => res,
-			Err(e) => {
-				println!("Worker thread panicked: {}", e);
-				Err(datafusion::error::DataFusionError::Execution("Panic occurred during query execution".to_string()))
-			}
-		};
+// 	// Start execution task
+// 	let handle = tokio::spawn(async move {
+// 		// Catch potential panics
+// 		let result = match tokio::task::spawn(async {
+// 			collect(node, ctx).await
+// 		}).await {
+// 			Ok(res) => res,
+// 			Err(e) => {
+// 				println!("Worker thread panicked: {}", e);
+// 				Err(datafusion::error::DataFusionError::Execution("Panic occurred during query execution".to_string()))
+// 			}
+// 		};
 		
-		// Send result (success or error)
-		let elapsed = start.elapsed();
-		let _ = result_tx.send((result, elapsed));
-	});
+// 		// Send result (success or error)
+// 		let elapsed = start.elapsed();
+// 		let _ = result_tx.send((result, elapsed));
+// 	});
 	
-	// Start timeout task
-	tokio::spawn(async move {
-		tokio::time::sleep(timeout).await;
-		let _ = cancel_tx.send(());
-	});
+// 	// Start timeout task
+// 	tokio::spawn(async move {
+// 		tokio::time::sleep(timeout).await;
+// 		let _ = cancel_tx.send(());
+// 	});
 	
-	// Wait for result or timeout
-	tokio::select! {
-		result = result_rx => {
-			match result {
-				Ok((res, time)) => {
-					println!("Query completed in {:?}", time);
-					match res {
-						Ok(data) => Ok(Some((data, time))),
-						Err(e) => {
-							println!("Error during execution: {}", e);
-							Ok(None)
-						}
-					}
-				},
-				Err(e) => {
-					println!("Channel closed unexpectedly: {}", e);
-					Ok(None)
-				}
-			}
-		},
-		_ = cancel_rx => {
-			println!("Timeout reached, cancelling task");
-			handle.abort();
-			Ok(None)
-		},
-		// Hard timeout to ensure no indefinite waiting
-		_ = tokio::time::sleep(hard_timeout) => {
-			println!("Hard timeout reached");
-			handle.abort();
-			Ok(None)
-		}
-	}
-}
+// 	// Wait for result or timeout
+// 	tokio::select! {
+// 		result = result_rx => {
+// 			match result {
+// 				Ok((res, time)) => {
+// 					println!("Query completed in {:?}", time);
+// 					match res {
+// 						Ok(data) => Ok(Some((data, time))),
+// 						Err(e) => {
+// 							println!("Error during execution: {}", e);
+// 							Ok(None)
+// 						}
+// 					}
+// 				},
+// 				Err(e) => {
+// 					println!("Channel closed unexpectedly: {}", e);
+// 					Ok(None)
+// 				}
+// 			}
+// 		},
+// 		_ = cancel_rx => {
+// 			println!("Timeout reached, cancelling task");
+// 			handle.abort();
+// 			Ok(None)
+// 		},
+// 		// Hard timeout to ensure no indefinite waiting
+// 		_ = tokio::time::sleep(hard_timeout) => {
+// 			println!("Hard timeout reached");
+// 			handle.abort();
+// 			Ok(None)
+// 		}
+// 	}
+// }
+
+// /// Recursively populate cardinality and runtime arrays.
+// // TODO need to be a *lot* more rigorous for the actual benchmarking here.
+// // one option is to try and integrate an existing optimizer like criterion
+// // or divan. Both of these don't really support usage as a library though...
+// // Doing this properly is an easy way to surpass TAQO.
+// //
+// // The other major TODO (this is long term) is to support the `fast` option 
+// // and implement the optimization in www.vldb.org/pvldb/vol2/vldb09-294.pdf
+// #[async_recursion]
+// async fn measure_subplan(
+// 	node: Arc<dyn ExecutionPlan>,
+// 	ctx: Arc<TaskContext>,
+// 	cfg: &BenchmarkConfig,
+// 	cards: &mut Vec<Result<usize, MeasureError>>,
+// 	times: &mut Vec<Result<Duration, MeasureError>>,
+// ) -> anyhow::Result<()> {
+// 	// First execute the current node
+// 	if let Some((batches, time)) = time_subplan(node.clone(), ctx.clone(), cfg.timeout).await? {
+// 		println!("\n=== Plan Execution Details ===");
+// 		println!("Number of batches received: {}", batches.len());
+// 		for (i, batch) in batches.iter().enumerate() {
+// 			println!("Batch {}: {} rows × {} columns", i, batch.num_rows(), batch.num_columns());
+// 		}
+// 		let cardinality: usize = batches.iter().map(|x| x.num_rows()).sum();
+// 		println!("Total cardinality: {}", cardinality);
+// 		println!("Execution time: {:?}", time);
+// 		println!("============================\n");
+		
+// 		// Push current node's result
+// 		cards.push(Ok(cardinality));
+// 		times.push(Ok(time));
+		
+// 		// If current node executed successfully, then process its children
+// 		for i in 0..node.children().len() {
+// 			let child = node.children()[i].clone();
+// 			measure_subplan(child, ctx.clone(), cfg, cards, times).await?;
+// 		}
+// 	} else {
+// 		// Current node timed out, no need to process children
+// 		cards.push(Err(MeasureError::Timeout));
+// 		times.push(Err(MeasureError::Timeout));
+		
+// 		// Use a non-recursive approach to mark all descendants as errors
+// 		// First, add all immediate children to our stack
+// 		let mut stack = Vec::new();
+// 		for i in 0..node.children().len() {
+// 			stack.push(node.children()[i].clone());
+// 		}
+		
+// 		// Process the stack until empty
+// 		while let Some(child_node) = stack.pop() {
+// 			// Mark this node as timeout error
+// 			cards.push(Err(MeasureError::Timeout));
+// 			times.push(Err(MeasureError::Timeout));
+			
+// 			// Add its children to the stack
+// 			for i in 0..child_node.children().len() {
+// 				stack.push(child_node.children()[i].clone());
+// 			}
+// 		}
+// 	}
+// 	Ok(())
+// }
+
 
 /// Recursively populate cardinality and runtime arrays.
 // TODO need to be a *lot* more rigorous for the actual benchmarking here.
@@ -160,53 +243,37 @@ async fn measure_subplan(
 	node: Arc<dyn ExecutionPlan>,
 	ctx: Arc<TaskContext>,
 	cfg: &BenchmarkConfig,
+	est_costs: &Vec<f64>,
+	idx: &mut usize,
 	cards: &mut Vec<Result<usize, MeasureError>>,
 	times: &mut Vec<Result<Duration, MeasureError>>,
+	tables: Arc<dyn SchemaProvider>,
 ) -> anyhow::Result<()> {
-	// First execute the current node
-	if let Some((batches, time)) = time_subplan(node.clone(), ctx.clone(), cfg.timeout).await? {
-		println!("\n=== Plan Execution Details ===");
-		println!("Number of batches received: {}", batches.len());
-		for (i, batch) in batches.iter().enumerate() {
-			println!("Batch {}: {} rows × {} columns", i, batch.num_rows(), batch.num_columns());
-		}
-		let cardinality: usize = batches.iter().map(|x| x.num_rows()).sum();
-		println!("Total cardinality: {}", cardinality);
-		println!("Execution time: {:?}", time);
-		println!("============================\n");
-		
-		// Push current node's result
-		cards.push(Ok(cardinality));
-		times.push(Ok(time));
-		
-		// If current node executed successfully, then process its children
-		for i in 0..node.children().len() {
-			let child = node.children()[i].clone();
-			measure_subplan(child, ctx.clone(), cfg, cards, times).await?;
-		}
-	} else {
-		// Current node timed out, no need to process children
-		cards.push(Err(MeasureError::Timeout));
-		times.push(Err(MeasureError::Timeout));
-		
-		// Use a non-recursive approach to mark all descendants as errors
-		// First, add all immediate children to our stack
-		let mut stack = Vec::new();
-		for i in 0..node.children().len() {
-			stack.push(node.children()[i].clone());
-		}
-		
-		// Process the stack until empty
-		while let Some(child_node) = stack.pop() {
-			// Mark this node as timeout error
-			cards.push(Err(MeasureError::Timeout));
-			times.push(Err(MeasureError::Timeout));
-			
-			// Add its children to the stack
-			for i in 0..child_node.children().len() {
-				stack.push(child_node.children()[i].clone());
+	// FIXME temporary hack
+	println!("est cost is {}", est_costs[*idx]);
+	if est_costs[*idx] > 1000000000000.0 || node.name() == "CrossJoinExec" {
+		cards.push(Err(MeasureError::Died));
+		times.push(Err(MeasureError::Died));
+	} else { 
+		println!("Timing subplan");
+		crate::common::dump_plan(node.clone(), 0);	
+		match time_subplan_ipc(node.clone(), cfg, tables.clone()).await? {
+			Ok((card, time)) => {
+				cards.push(Ok(card));
+				println!("got {} and putting result into index {}",
+						 time.as_millis(), times.len());
+				times.push(Ok(time));
+			},
+			Err(e) => {
+				cards.push(Err(e));
+				times.push(Err(e));
 			}
 		}
+	}
+	for child in node.children() {
+		*idx += 1;
+		measure_subplan(child.clone(), ctx.clone(), cfg, &est_costs,
+						idx, cards, times, tables.clone()).await?;
 	}
 	Ok(())
 }
@@ -219,16 +286,23 @@ async fn measure_plan(
 	plan: Plan,
 	ctx: Arc<TaskContext>,
 	cfg: &BenchmarkConfig,
+	tables: Arc<dyn SchemaProvider>,
 ) -> anyhow::Result<MeasuredPlan> {
 	let mut cardinalities = Vec::new();
 	let mut runtimes = Vec::new();
 	// FIXME temporary hack to get around OOMs. obviously not generic.
-	if plan.est_costs[0] < 1000000000.0 {
-		measure_subplan(plan.tree.clone(), ctx, cfg, &mut cardinalities, &mut runtimes).await?;
-	} else {
-		cardinalities.push(Err(MeasureError::Died));
-		runtimes.push(Err(MeasureError::Died));
+	if plan.est_costs[0] > 832146202382.0 {
+		let size = plan.size();
+		return Ok(MeasuredPlan {
+			plan,
+			runtime: Err(MeasureError::Died),
+			sub_runtimes: Some(vec![Err(MeasureError::Died); size]),
+			cardinalities: vec![Err(MeasureError::Died); size],
+		});
 	}
+	let mut idx = 0;
+	measure_subplan(plan.tree.clone(), ctx, cfg, &plan.est_costs, &mut idx,
+					&mut cardinalities, &mut runtimes, tables).await?;
 	if let Ok(runtime) = runtimes[0] {
 		println!("ran plan in {}ms (est cost {})", runtime.as_millis(), plan.est_costs[0]);
 	} else {
@@ -245,13 +319,12 @@ async fn measure_plan(
 // this version is for cross-process stuff...
 // but switching to `ListingTable`s kinda fixed OOM issues
 /// Measure cardinalities and runtimes of plan and subplans.
-async fn measure_plan_ipc(
-	plan: Plan,
-	ctx: Arc<TaskContext>,
+async fn time_subplan_ipc(
+	plan: Arc<dyn ExecutionPlan>,
 	cfg: &BenchmarkConfig,
 	tables: Arc<dyn SchemaProvider>,
-) -> anyhow::Result<MeasuredPlan> {
-	let bytes = physical_plan_to_bytes(plan.clone().tree)?;
+) -> anyhow::Result<Result<(usize, Duration), MeasureError>> {
+	let bytes = physical_plan_to_bytes(plan)?;
 	let mut plan_file = tempfile::NamedTempFile::new()?;
 	plan_file.write_all(&bytes)?;
 
@@ -267,26 +340,25 @@ async fn measure_plan_ipc(
 	let bytes = serde_json::to_string(&schemas)?;
 	let mut schema_file = tempfile::NamedTempFile::new()?;
 	schema_file.write_all(bytes.as_bytes())?;
-
+	
 	let out_file = tempfile::NamedTempFile::new()?;
 	let output = std::process::Command::new("../optdbg/target/release/runner")
 		.arg("-p").arg(plan_file.path())
 		.arg("-c").arg(cfg_file.path())
 		.arg("-s").arg(schema_file.path())
 		.arg("-o").arg(out_file.path())
-		.status()?;
+		.output()?;
 	
-	if !output.success() {
-		let size = plan.size();
-		Ok(MeasuredPlan {
-			plan,
-			runtime: Err(MeasureError::Died),
-			cardinalities: vec![Err(MeasureError::Died); size],
-			sub_runtimes: Some(vec![Err(MeasureError::Died); size]),
-		})
+	if !output.status.success() {
+		Ok(Err(MeasureError::Died))
 	} else {
-		let measurements: PlanMeasurements = serde_json::from_reader(out_file)?;
-		Ok(MeasuredPlan::new(plan, measurements))
+		println!("{}", String::from_utf8_lossy(&output.stdout));
+		let res: Option<(usize, Duration)> = serde_json::from_reader(out_file)?;
+		if let Some(measurements) = res {
+			Ok(Ok(measurements))
+		} else {
+			Ok(Err(MeasureError::Timeout))
+		}
 	}
 }
 
@@ -471,8 +543,6 @@ fn calculate_performance_factor(plans: &[MeasuredPlan], chosen_idx: usize) -> f6
 		return 0.0;
 	}
 	
-	println!("\nPerformance Factor (PF): {:.2}%", (plans_worse_or_equal as f64 / valid_plans as f64) * 100.0);
-	
 	// Return PF as a fraction (0.0 to 1.0)
 	plans_worse_or_equal as f64 / valid_plans as f64
 }
@@ -511,10 +581,10 @@ pub fn benchmark(
 		let mut out = Vec::new();
 		// TODO best measurement should definitely be interleaved in to avoid
 		// warmup time affecting measurements or something like that...
-		let best = measure_plan_ipc(sample.best_plan, ctx.clone(), &cfg, sample.tables.clone()).await?;
+		let best = measure_plan(sample.best_plan, ctx.clone(), &cfg, sample.tables.clone()).await?;
 		for plan in sample.alternates.into_iter()
 			.sorted_by(|x, y| x.est_costs[0].partial_cmp(&y.est_costs[0]).unwrap()) {
-				out.push(measure_plan_ipc(plan, ctx.clone(), &cfg, sample.tables.clone()).await?);
+				out.push(measure_plan(plan, ctx.clone(), &cfg, sample.tables.clone()).await?);
 			}
 		out.sort_by(|x, y| {
 			if x.runtime.is_err() {

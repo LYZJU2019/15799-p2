@@ -378,6 +378,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "asciibox"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "40a19faf92f9a643b8e3bb4295cc0f15364388d4a2e25e81c841d1b6d8cd58b8"
+dependencies = [
+ "lazy_static 1.5.0",
+]
+
+[[package]]
+name = "asciigraph"
+version = "0.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "98252bed54ed2309e47e365a1edf3728cddfb356b9bc7e104baede53fa0ef47b"
+dependencies = [
+ "asciibox",
+ "clap",
+ "hmath",
+ "json",
+ "lazy_static 1.5.0",
+]
+
+[[package]]
 name = "assert_approx_eq"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2023,6 +2045,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 
 [[package]]
+name = "hmath"
+version = "0.1.17"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "489fc78c007893109d4052672efef516b2bc42b147bf5ce9bf983674b802fbc3"
+
+[[package]]
 name = "humantime"
 version = "2.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2338,6 +2366,12 @@ dependencies = [
  "once_cell",
  "wasm-bindgen",
 ]
+
+[[package]]
+name = "json"
+version = "0.12.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "078e285eafdfb6c4b434e0d31e8cfcb5115b651496faca5749b88fafd4f23bfd"
 
 [[package]]
 name = "json5"
@@ -2815,6 +2849,7 @@ name = "optdbg"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "asciigraph",
  "async-recursion",
  "async-trait",
  "chrono",

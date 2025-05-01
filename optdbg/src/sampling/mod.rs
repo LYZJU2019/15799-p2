@@ -394,41 +394,41 @@ impl OptdOldBackend {
         }
     }
 
-    async fn get_alts_memo(&mut self, st: &SessionState) -> Result<Vec<Plan>> {
-        let opt = self.opt.as_ref().unwrap();
-        let (gid, _, _) = self.best_cascades.take().unwrap();
-        let mut set = HashSet::new();
-        let mut fake_meta = HashMap::new();
-        let mut physical_expr_count = HashMap::new();
-        let plans =
-            Self::get_alts_help(opt, gid, &mut set, &mut fake_meta, &mut physical_expr_count);
+    // async fn get_alts_memo(&mut self, st: &SessionState) -> Result<Vec<Plan>> {
+    //     let opt = self.opt.as_ref().unwrap();
+    //     let (gid, _, _) = self.best_cascades.take().unwrap();
+    //     let mut set = HashSet::new();
+    //     let mut fake_meta = HashMap::new();
+    //     let mut physical_expr_count = HashMap::new();
+    //     let plans =
+    //         Self::get_alts_help(opt, gid, &mut set, &mut fake_meta, &mut physical_expr_count);
 
-        // compare physical_expr_count with the number of physical expressions in the memo
-        for (group_id, count) in physical_expr_count {
-            let memo_count = opt
-                .cascades_optimizer
-                .memo
-                .get_group_physical_expr_count(group_id);
+    //     // compare physical_expr_count with the number of physical expressions in the memo
+    //     for (group_id, count) in physical_expr_count {
+    //         let memo_count = opt
+    //             .cascades_optimizer
+    //             .memo
+    //             .get_group_physical_expr_count(group_id);
 
-            if count != memo_count {
-                println!(
-                    "Group {group_id} has {count} physical expressions in the plan, but {memo_count} in the memo"
-                );
-            }
-        }
+    //         if count != memo_count {
+    //             println!(
+    //                 "Group {group_id} has {count} physical expressions in the plan, but {memo_count} in the memo"
+    //             );
+    //         }
+    //     }
 
-        println!("Found {} alternates", plans.len());
-        let mut opt_ctx = OptdPlanContext::new(st);
-        opt_ctx.conv_into_optd_og(&self.plan.clone().unwrap())?;
-        opt_ctx.optimizer = Some(&opt);
-        let mut out = Vec::new();
-        for plan in plans {
-            println!("{plan}");
-            let phys_plan = opt_ctx.conv_from_optd_og(plan, fake_meta.clone()).await?;
-            out.push(Plan::new(phys_plan, vec![], vec![]))
-        }
-        Ok(out)
-    }
+    //     println!("Found {} alternates", plans.len());
+    //     let mut opt_ctx = OptdPlanContext::new(st);
+    //     opt_ctx.conv_into_optd_og(&self.plan.clone().unwrap())?;
+    //     opt_ctx.optimizer = Some(&opt);
+    //     let mut out = Vec::new();
+    //     for plan in plans {
+    //         println!("{plan}");
+    //         let phys_plan = opt_ctx.conv_from_optd_og(plan, fake_meta.clone()).await?;
+    //         out.push(Plan::new(phys_plan, vec![], vec![]))
+    //     }
+    //     Ok(out)
+    // }
 
     /// Implements rule-based sampling for optd-old backend.
     // TODO Be a lot smarter about this: can pre-filter rules for applicability,
@@ -579,7 +579,7 @@ impl Sampler for OptdOldBackend {
     async fn get_alternates(&mut self, st: &SessionState) -> Result<Vec<Plan>> {
         match &self.strat {
             SampleStrategy::RuleBased(t) => self.get_alts_rule(st, *t).await,
-            SampleStrategy::MemoBased => self.get_alts_memo(st).await,
+            // SampleStrategy::MemoBased => self.get_alts_memo(st).await,
             _ => unreachable!(),
         }
     }
