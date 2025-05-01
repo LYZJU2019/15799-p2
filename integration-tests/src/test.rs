@@ -25,6 +25,7 @@ async fn main() -> anyhow::Result<()> {
         // 3. Added hard timeout to ensure the task will terminate
         timeout: Some(std::time::Duration::from_secs(10)),
         fast: false,
+        enable_cache: true, // Enable plan caching to avoid re-running identical plans
     };
 
     let a_cfg = AnalysisConfig;
@@ -48,12 +49,38 @@ async fn main() -> anyhow::Result<()> {
 		let df_ctx = df_ctx.clone();
 		let table_paths = table_paths.clone();
 		async move {
-			let sql = std::fs::read_to_string(path.as_ref().unwrap().path()).unwrap();
+			let path_result = path.map_err(|e| anyhow::anyhow!("Failed to read directory entry: {}", e));
+			let path_entry = match path_result {
+				Ok(entry) => entry,
+				Err(e) => return Err(e),
+			};
+			
+			let file_path = path_entry.path();
+			
+			// Read as bytes first, then handle UTF-8 conversion
+			let sql_bytes = match std::fs::read(&file_path) {
+				Ok(bytes) => bytes,
+				Err(e) => return Err(anyhow::anyhow!("Failed to read file {:?}: {}", file_path, e)),
+			};
+			
+			// Try to convert to UTF-8 string
+			let sql = match String::from_utf8(sql_bytes) {
+				Ok(s) => s,
+				Err(e) => return Err(anyhow::anyhow!("File {:?} contains invalid UTF-8: {}", file_path, e)),
+			};
+			
 			let df = df_ctx.sql(&sql).await?;
 			let (state, plan) = df.into_parts();
 			let tables = df_ctx.state().schema_for_ref("part")?;
+			
+			// Convert path to string, handling potential UTF-8 errors
+			let name = match file_path.into_os_string().into_string() {
+				Ok(s) => s,
+				Err(os_str) => format!("<non-utf8-path-{:?}>", os_str),
+			};
+			
 			Ok(QueryInfo {
-				name: path.unwrap().path().into_os_string().into_string().unwrap(),
+				name,
 				plan,
 				backend: Arc::new(
 					OptdOldBackend::new(
@@ -74,12 +101,4 @@ async fn main() -> anyhow::Result<()> {
 	println!("{report}");
 
     Ok(())
-}
-
-fn dump_plan(plan: &LogicalPlan, name: &str) {
-    let mut file = std::fs::File::create(name).unwrap();
-
-    file.write(format!("{:#?}", plan).as_bytes()).unwrap();
-
-    file.flush().unwrap();
 }

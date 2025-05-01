@@ -1,11 +1,12 @@
 use std::io::Write;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use std::collections::HashMap;
 
 use datafusion::arrow::array::RecordBatch;
 use datafusion::catalog::SchemaProvider;
 use datafusion::execution::TaskContext;
-use datafusion::physical_plan::{collect, ExecutionPlan};
+use datafusion::physical_plan::{collect, ExecutionPlan, ExecutionPlanVisitor, PhysicalExpr};
 use datafusion_proto::bytes::physical_plan_to_bytes;
 use futures::{Stream, StreamExt};
 use itertools::Itertools;
@@ -15,10 +16,112 @@ use async_recursion::async_recursion;
 use crate::sampling::SampleOutput;
 use crate::common::{dump_plan, MeasureError, Plan, PlanMeasurements};
 
+// Plan cache to avoid re-executing identical plans
+#[derive(Default)]
+struct PlanCache {
+	// Maps plan hash to execution results (cardinality, duration)
+	cache: HashMap<u64, Result<(usize, Duration), MeasureError>>,
+	// Track cache hits for statistics
+	hits: usize,
+	// Track cache misses
+	misses: usize,
+}
+
+impl PlanCache {
+	fn new() -> Self {
+		Self {
+			cache: HashMap::new(),
+			hits: 0,
+			misses: 0,
+		}
+	}
+
+	// Try to get a cached result
+	fn get(&mut self, plan_hash: u64) -> Option<&Result<(usize, Duration), MeasureError>> {
+		if let Some(result) = self.cache.get(&plan_hash) {
+			self.hits += 1;
+			Some(result)
+		} else {
+			self.misses += 1;
+			None
+		}
+	}
+
+	// Cache a new result
+	fn insert(&mut self, plan_hash: u64, result: Result<(usize, Duration), MeasureError>) {
+		self.cache.insert(plan_hash, result);
+	}
+
+	// Get cache statistics
+	fn stats(&self) -> (usize, usize, f64) {
+		let total = self.hits + self.misses;
+		let hit_rate = if total > 0 {
+			self.hits as f64 / total as f64
+		} else {
+			0.0
+		};
+		(self.hits, self.misses, hit_rate)
+	}
+}
+
+// Thread-local storage for the plan cache
+thread_local! {
+	static PLAN_CACHE: std::cell::RefCell<PlanCache> = std::cell::RefCell::new(PlanCache::new());
+}
+
+// Hash function for execution plans
+fn hash_plan(plan: &Arc<dyn ExecutionPlan>) -> u64 {
+	use std::collections::hash_map::DefaultHasher;
+	use std::hash::{Hash, Hasher};
+	
+	// Create a hasher
+	let mut hasher = DefaultHasher::new();
+	
+	// Hash the plan type and schema
+	plan.name().hash(&mut hasher);
+	plan.schema().to_string().hash(&mut hasher);
+	
+	// Manually visit each child and hash it too
+	fn visit_plan(plan: &Arc<dyn ExecutionPlan>, hasher: &mut DefaultHasher) {
+		plan.name().hash(hasher);
+		plan.schema().to_string().hash(hasher);
+		
+		// Visit children
+		for child in plan.children() {
+			visit_plan(&child, hasher);
+		}
+	}
+	
+	// Start recursion
+	visit_plan(plan, &mut hasher);
+	
+	// Return the hash
+	hasher.finish()
+}
+
+// Determine if a plan is small enough to cache
+fn is_plan_cacheable(plan: &Arc<dyn ExecutionPlan>) -> bool {
+	// Only cache plans with limited number of children to save memory
+	// This is a simple heuristic - you may want to use more sophisticated criteria
+	let max_nodes = 10;
+	let mut node_count = 0;
+	
+	fn count_nodes(plan: &Arc<dyn ExecutionPlan>, count: &mut usize) {
+		*count += 1;
+		for child in plan.children() {
+			count_nodes(&child, count);
+		}
+	}
+	
+	count_nodes(plan, &mut node_count);
+	node_count <= max_nodes
+}
+
 #[derive(Serialize, Deserialize, Clone, Copy)]
 pub struct BenchmarkConfig {
 	pub fast: bool,
 	pub timeout: Option<Duration>,
+	pub enable_cache: bool,
 }
 
 // placeholder type
@@ -318,10 +421,57 @@ async fn measure_plan(
 	})
 }
 
-// this version is for cross-process stuff...
-// but switching to `ListingTable`s kinda fixed OOM issues
 /// Measure cardinalities and runtimes of plan and subplans.
 async fn time_subplan_ipc(
+	plan: Arc<dyn ExecutionPlan>,
+	cfg: &BenchmarkConfig,
+	tables: Arc<dyn SchemaProvider>,
+) -> anyhow::Result<Result<(usize, Duration), MeasureError>> {
+	// Skip cache if caching is disabled in config
+	if !cfg.enable_cache {
+		return run_plan_ipc(plan, cfg, tables).await;
+	}
+	
+	// Only cache if plan is small enough
+	if !is_plan_cacheable(&plan) {
+		return run_plan_ipc(plan, cfg, tables).await;
+	}
+	
+	// Calculate plan hash
+	let plan_hash = hash_plan(&plan);
+	
+	// Check cache
+	let cached_result = PLAN_CACHE.with(|cache| {
+		cache.borrow_mut().get(plan_hash).cloned()
+	});
+	
+	if let Some(result) = cached_result {
+		println!("Cache hit! Reusing previous execution result");
+		return Ok(result);
+	}
+	
+	// Cache miss, execute the plan
+	let result = run_plan_ipc(plan, cfg, tables).await?;
+	
+	// Update cache with new result
+	PLAN_CACHE.with(|cache| {
+		cache.borrow_mut().insert(plan_hash, result.clone());
+	});
+	
+	// Periodically log cache statistics
+	PLAN_CACHE.with(|cache| {
+		let (hits, misses, rate) = cache.borrow().stats();
+		if (hits + misses) % 100 == 0 && hits + misses > 0 {
+			println!("Plan cache: {} hits, {} misses, {:.2}% hit rate", 
+					 hits, misses, rate * 100.0);
+		}
+	});
+	
+	Ok(result)
+}
+
+/// Actual implementation that runs the plan through IPC
+async fn run_plan_ipc(
 	plan: Arc<dyn ExecutionPlan>,
 	cfg: &BenchmarkConfig,
 	tables: Arc<dyn SchemaProvider>,
