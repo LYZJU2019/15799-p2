@@ -289,10 +289,13 @@ impl OptdOldBackend {
         gid: GroupId,
         visited: &mut HashSet<ExprId>,
         fake_meta: &mut PlanNodeMetaMap,
+        physical_expr_count: &mut HashMap<GroupId, usize>,
     ) -> Vec<ArcDfPlanNode> {
         let mut out = Vec::new();
         let exprs = &opt.cascades_optimizer.memo.get_group(gid).group_exprs;
-        // println!("Processing group {gid} with {exprs:?}");
+
+        // println!("Group {gid} has {} expressions", exprs.len());
+        let mut physical_cnt = 0;
         for expr_id in exprs {
             if visited.contains(expr_id) {
                 continue;
@@ -313,10 +316,14 @@ impl OptdOldBackend {
             ) {
                 continue;
             }
+            physical_cnt += 1;
             let mut children: Vec<Vec<ArcDfPlanNode>> = Vec::with_capacity(expr.children.len());
             for child in &expr.children {
                 // println!("Expr w/ id {expr_id} (aka {}) is has child in group {child}", expr.typ)
-                children.push(Self::get_alts_help(opt, *child, visited, fake_meta));
+                let child_alts =
+                    Self::get_alts_help(opt, *child, visited, fake_meta, physical_expr_count);
+                children.push(child_alts);
+                // println!("Child group {child} has {} alternatives", len);
             }
 
             if children.is_empty() {
@@ -351,6 +358,13 @@ impl OptdOldBackend {
                 }
             }
         }
+
+        physical_expr_count
+            .entry(gid)
+            .and_modify(|x| *x += physical_cnt)
+            .or_insert(physical_cnt);
+
+        // println!("Group {gid} has {} physical expressions in memo", memo_cnt);
         out
     }
 
@@ -385,7 +399,24 @@ impl OptdOldBackend {
         let (gid, _, _) = self.best_cascades.take().unwrap();
         let mut set = HashSet::new();
         let mut fake_meta = HashMap::new();
-        let plans = Self::get_alts_help(opt, gid, &mut set, &mut fake_meta);
+        let mut physical_expr_count = HashMap::new();
+        let plans =
+            Self::get_alts_help(opt, gid, &mut set, &mut fake_meta, &mut physical_expr_count);
+
+        // compare physical_expr_count with the number of physical expressions in the memo
+        for (group_id, count) in physical_expr_count {
+            let memo_count = opt
+                .cascades_optimizer
+                .memo
+                .get_group_physical_expr_count(group_id);
+
+            if count != memo_count {
+                println!(
+                    "Group {group_id} has {count} physical expressions in the plan, but {memo_count} in the memo"
+                );
+            }
+        }
+
         println!("Found {} alternates", plans.len());
         let mut opt_ctx = OptdPlanContext::new(st);
         opt_ctx.conv_into_optd_og(&self.plan.clone().unwrap())?;
