@@ -7,6 +7,7 @@ use datafusion::catalog::SchemaProvider;
 use datafusion::execution::TaskContext;
 use datafusion::physical_plan::{collect, ExecutionPlan};
 use datafusion_proto::bytes::physical_plan_to_bytes;
+use futures::{Stream, StreamExt};
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use async_recursion::async_recursion;
@@ -14,7 +15,7 @@ use async_recursion::async_recursion;
 use crate::sampling::SampleOutput;
 use crate::common::{Plan, PlanMeasurements, MeasureError};
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone, Copy)]
 pub struct BenchmarkConfig {
 	pub fast: bool,
 	pub timeout: Option<Duration>,
@@ -35,6 +36,7 @@ pub struct OptimizerMetrics {
 }
 
 pub struct BenchmarkOutput {
+	pub name: String,
 	/// Sorted by runtime (fastest at front).
 	pub plans: Vec<MeasuredPlan>,
 	/// Index of the chosen plan in the `plans` field.
@@ -500,52 +502,57 @@ impl CardQuality {
 	}
 }
 
-pub async fn benchmark(
-	sample: SampleOutput,
+pub fn benchmark(
+	samples: impl Stream<Item = SampleOutput>,
 	cfg: BenchmarkConfig
-) -> anyhow::Result<BenchmarkOutput> {
-	let ctx = sample.session.task_ctx();
-	let mut out = Vec::new();
-	// TODO best measurement should definitely be interleaved in to avoid
-	// warmup time affecting measurements or something like that...
-	let best = measure_plan_ipc(sample.best_plan, ctx.clone(), &cfg, sample.tables.clone()).await?;
-	for plan in sample.alternates.into_iter()
-		.sorted_by(|x, y| x.est_costs[0].partial_cmp(&y.est_costs[0]).unwrap()) {
-		out.push(measure_plan_ipc(plan, ctx.clone(), &cfg, sample.tables.clone()).await?);
-	}
-	out.sort_by(|x, y| {
-		if x.runtime.is_err() {
-			std::cmp::Ordering::Greater
-		} else if y.runtime.is_err() {
-			std::cmp::Ordering::Less
-		} else {
-			x.runtime.unwrap().cmp(&y.runtime.unwrap())
-		}
-	});
-	let chosen_idx = out.iter()
-		.position(|x| x.runtime.is_err() ||
-				  best.runtime.is_ok() && x.runtime.unwrap() > best.runtime.unwrap())
-		.unwrap_or(out.len());
-	out.insert(chosen_idx, best);
-	
-	// Calculate cost rank accuracy
-	let (taqo_s, taqo_percent) = calculate_cost_rank_accuracy(&out);
-	
-	// Calculate Performance Factor (PF)
-	let performance_factor = calculate_performance_factor(&out, chosen_idx);
-	
-	// Calculate average Q-Error for the chosen plan
-	let avg_q_error = calculate_avg_q_error(&out[chosen_idx]);
-	
-	Ok(BenchmarkOutput {
-		plans: out,
-		chosen_idx,
-		metrics: OptimizerMetrics {
-			taqo_score_s: taqo_s,
-			taqo_accuracy_percent: taqo_percent,
-			performance_factor,
-			avg_q_error,
-		}
+) -> impl Stream<Item = BenchmarkOutput> {
+	samples.then(move |sample| async move {
+		let ctx = sample.session.task_ctx();
+		let mut out = Vec::new();
+		// TODO best measurement should definitely be interleaved in to avoid
+		// warmup time affecting measurements or something like that...
+		let best = measure_plan_ipc(sample.best_plan, ctx.clone(), &cfg, sample.tables.clone()).await?;
+		for plan in sample.alternates.into_iter()
+			.sorted_by(|x, y| x.est_costs[0].partial_cmp(&y.est_costs[0]).unwrap()) {
+				out.push(measure_plan_ipc(plan, ctx.clone(), &cfg, sample.tables.clone()).await?);
+			}
+		out.sort_by(|x, y| {
+			if x.runtime.is_err() {
+				std::cmp::Ordering::Greater
+			} else if y.runtime.is_err() {
+				std::cmp::Ordering::Less
+			} else {
+				x.runtime.unwrap().cmp(&y.runtime.unwrap())
+			}
+		});
+		let chosen_idx = out.iter()
+			.position(|x| x.runtime.is_err() ||
+					  best.runtime.is_ok() && x.runtime.unwrap() > best.runtime.unwrap())
+			.unwrap_or(out.len());
+		out.insert(chosen_idx, best);
+		
+		// Calculate cost rank accuracy
+		let (taqo_s, taqo_percent) = calculate_cost_rank_accuracy(&out);
+		
+		// Calculate Performance Factor (PF)
+		let performance_factor = calculate_performance_factor(&out, chosen_idx);
+		
+		// Calculate average Q-Error for the chosen plan
+		let avg_q_error = calculate_avg_q_error(&out[chosen_idx]);
+		
+		Ok(BenchmarkOutput {
+			name: sample.name,
+			plans: out,
+			chosen_idx,
+			metrics: OptimizerMetrics {
+				taqo_score_s: taqo_s,
+				taqo_accuracy_percent: taqo_percent,
+				performance_factor,
+				avg_q_error,
+			}
+		})
+	}).filter_map(|x: anyhow::Result<BenchmarkOutput>| async {
+		x.ok()
 	})
 }
 

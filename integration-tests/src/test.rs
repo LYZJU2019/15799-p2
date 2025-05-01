@@ -1,6 +1,7 @@
 use std::io::Write;
 use std::sync::Arc;
 
+use futures::StreamExt;
 use datafusion::execution::context::{SessionConfig, SessionContext};
 use datafusion::prelude::ParquetReadOptions;
 use datafusion_expr::LogicalPlan;
@@ -14,79 +15,10 @@ use test_utils::tpch::tpch_schemas;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // tracing_subscriber::fmt()
-    // 	.with_max_level(tracing::Level::DEBUG)
-    // 	.init();
-
-	let tpch_query_3 = "
-SELECT
-    l_returnflag,
-    l_linestatus,
-    sum(l_quantity) as sum_qty,
-    sum(l_extendedprice) as sum_base_price,
-    sum(l_extendedprice * (1.0 - l_discount)) as sum_disc_price,
-    sum(l_extendedprice * (1.0 - l_discount) * (1.0 + l_tax)) as sum_charge,
-    avg(l_quantity) as avg_qty,
-    avg(l_extendedprice) as avg_price,
-    avg(l_discount) as avg_disc,
-    count(*) as count_order
-FROM
-    lineitem
-WHERE
-    l_shipdate <= date '1998-09-01' - interval '90' day
-GROUP BY
-    l_returnflag,
-    l_linestatus
-ORDER BY
-    l_returnflag,
-    l_linestatus;
-";
-	
-    let tpch_query_9 = "
-select
-	nation,
-	sum(amount) as sum_profit
-from
-	(
-		select
-			n_name as nation,
-			l_extendedprice - ps_supplycost * l_quantity as amount
-		from
-			part,
-			supplier,
-			lineitem,
-			partsupp,
-			orders,
-			nation
-		where
-			s_suppkey = l_suppkey
-			and ps_suppkey = l_suppkey
-			and ps_partkey = l_partkey
-			and p_partkey = l_partkey
-			and o_orderkey = l_orderkey
-			and s_nationkey = n_nationkey
-			and p_name like '%green%'
-	) as profit
-group by
-	nation
-LIMIT 1;
-";
-
-    let ex_tpch = "
-SELECT 1 FROM Lineitem, Orders, Customer
-WHERE l_orderkey = o_orderkey
-AND o_custkey = c_custkey
-AND l_shipdate > date '2008-01-01'
-AND l_receiptdate < date '2008-02-01'
-AND l_discount < 0.05
-AND o_orderpriority = 'HIGH'
-AND c_mktsegment = 'AUTOMOBILE'
-";
 
     let s_cfg = SampleConfig;
 
     let b_cfg = BenchmarkConfig {
-
         // Set timeout with enhanced timeout mechanism:
         // 1. Execute from top to bottom, skip all child nodes if parent node times out
         // 2. Added panic catching to prevent Arrow library errors from crashing the program
@@ -111,29 +43,37 @@ AND c_mktsegment = 'AUTOMOBILE'
             .await?;
     }
 
-    let df = df_ctx.sql(&tpch_query_9).await?;
-
-    let (state, plan) = df.into_parts();
-
-    dump_plan(&plan, "original_plan.txt");
-
-    let tables = df_ctx.state().schema_for_ref("part")?;
-    let query = QueryInfo {
-        plan,
-        backend: Arc::new(
-            OptdOldBackend::new(
-                tables.clone(),
-                table_paths,
-                SampleStrategy::RuleBased(RuleBailStrategy::Threshold(10)),
-                true,
-            )
-            .await?,
-        ),
-        state,
-        tables,
-    };
-
-    println!("{}", optdbg::report_query(query, s_cfg, b_cfg, a_cfg).await?);
+	let paths = std::fs::read_dir("./tpch-queries").unwrap();
+	let stream = futures::stream::iter(paths.into_iter()).then(|path| {
+		let df_ctx = df_ctx.clone();
+		let table_paths = table_paths.clone();
+		async move {
+			let sql = std::fs::read_to_string(path.as_ref().unwrap().path()).unwrap();
+			let df = df_ctx.sql(&sql).await?;
+			let (state, plan) = df.into_parts();
+			let tables = df_ctx.state().schema_for_ref("part")?;
+			Ok(QueryInfo {
+				name: path.unwrap().path().into_os_string().into_string().unwrap(),
+				plan,
+				backend: Arc::new(
+					OptdOldBackend::new(
+						tables.clone(),
+						table_paths,
+						SampleStrategy::RuleBased(RuleBailStrategy::Threshold(10)),
+						true,
+					)
+						.await?,
+				),
+				state,
+				tables,
+			})
+		}
+	}).filter_map(|x: anyhow::Result<QueryInfo>| async { x.ok() });
+	
+	let reports = optdbg::report_query(stream, s_cfg, b_cfg, a_cfg).await?;
+	for report in reports {
+		println!("{report}");
+	}
 
     Ok(())
 }

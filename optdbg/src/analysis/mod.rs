@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use datafusion::{common::HashMap, physical_plan::ExecutionPlan};
+use futures::{Stream, StreamExt};
 use itertools::Itertools;
 
 use crate::{benchmark::{calculate_q_error, BenchmarkOutput, CardQuality, MeasuredPlan, OptimizerMetrics}, common::{partial_eq_plans, MeasureError}};
@@ -16,6 +17,7 @@ pub enum NodeProblem {
 }
 
 pub struct Report {
+	pub name: String,
 	pub metrics: OptimizerMetrics,
 	pub samples: Vec<MeasuredPlan>,
 	/// Index of chosen plan in `samples` field.
@@ -70,6 +72,7 @@ impl Report {
 
 impl std::fmt::Display for Report {	
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		writeln!(f, "{}", self.name)?;
 		writeln!(f, "=================== GLOBAL STATS ===================\n")?;
 		writeln!(f, "Sampled {} plans.", self.samples.len())?;
 		writeln!(f, "TAQO Score (s): {:.4} (lower is better)", self.metrics.taqo_score_s)?;
@@ -136,61 +139,69 @@ fn proc_plan(
 	}
 }
 
-pub fn analyze(bench: BenchmarkOutput, _cfg: AnalysisConfig) -> Report {
-	let placement: Vec<_> = bench.plans.iter().enumerate()
-		.sorted_by(|(_, x), (_, y)| x.plan.est_costs[0].partial_cmp(&y.plan.est_costs[0]).unwrap())
-		.map(|(x, _)| x).collect();
-	let mut est_ranks = vec![0; placement.len()];
-	for i in &placement {
-		est_ranks[placement[*i]] = *i;
-	}
-	let mut problems = HashMap::new();
-	for (i, plan) in bench.plans.iter().enumerate() {
-		let mut plan_problems = HashMap::new();
-		let mut idx = 0;
-		proc_plan(plan.plan.tree.clone(), &mut idx, plan, &mut plan_problems);
-		problems.insert(i, plan_problems);
-	}
-
-	for (i, plan) in bench.plans.iter().enumerate() {
-		let sz = plan.plan.size();
-		let plan_problems = problems.get_mut(&i).unwrap();
-		for n_i in 0..sz {
-			let Ok(runtime) = plan.sub_runtimes.as_ref().unwrap()[n_i] else {
-				continue
-			};
-			let mut est_rank = 0;
-			let mut real_rank = 0;
-			for (j, oplan) in bench.plans.iter().enumerate() {
-				if i == j { continue }
-				if partial_eq_plans(plan.plan.tree.clone(), oplan.plan.tree.clone(), n_i) {
-					let Ok(oruntime) = oplan.sub_runtimes.as_ref().unwrap()[n_i] else {
-						continue
-					};
-					if oplan.plan.est_costs[n_i] < plan.plan.est_costs[n_i] {
-						est_rank += 1;
-					}
-					if oruntime < runtime
-					{
-						real_rank += 1;
+pub async fn analyze(
+	benches: impl Stream<Item = BenchmarkOutput>,
+	_cfg: AnalysisConfig
+) -> Vec<Report> {
+	benches.then(|bench| async move {	
+		let placement: Vec<_> = bench.plans.iter().enumerate()
+			.sorted_by(|(_, x), (_, y)| x.plan.est_costs[0]
+					   .partial_cmp(&y.plan.est_costs[0]).unwrap())
+			.map(|(x, _)| x).collect();
+		let mut est_ranks = vec![0; placement.len()];
+		for i in &placement {
+			est_ranks[placement[*i]] = *i;
+		}
+		let mut problems = HashMap::new();
+		for (i, plan) in bench.plans.iter().enumerate() {
+			let mut plan_problems = HashMap::new();
+			let mut idx = 0;
+			proc_plan(plan.plan.tree.clone(), &mut idx, plan, &mut plan_problems);
+			problems.insert(i, plan_problems);
+		}
+		
+		for (i, plan) in bench.plans.iter().enumerate() {
+			let sz = plan.plan.size();
+			let plan_problems = problems.get_mut(&i).unwrap();
+			for n_i in 0..sz {
+				let Ok(runtime) = plan.sub_runtimes.as_ref().unwrap()[n_i] else {
+					continue
+				};
+				let mut est_rank = 0;
+				let mut real_rank = 0;
+				for (j, oplan) in bench.plans.iter().enumerate() {
+					if i == j { continue }
+					if partial_eq_plans(plan.plan.tree.clone(), oplan.plan.tree.clone(), n_i) {
+						let Ok(oruntime) = oplan.sub_runtimes.as_ref().unwrap()[n_i] else {
+							continue
+						};
+						if oplan.plan.est_costs[n_i] < plan.plan.est_costs[n_i] {
+							est_rank += 1;
+						}
+						if oruntime < runtime
+						{
+							real_rank += 1;
+						}
 					}
 				}
-			}
-			if est_rank != real_rank {
-				add_problem(plan_problems, &n_i, NodeProblem::CostMisestimation(
-					plan.plan.est_costs[n_i],
-					est_rank,
-					real_rank,
-				));
+				if est_rank != real_rank {
+					add_problem(plan_problems, &n_i, NodeProblem::CostMisestimation(
+						plan.plan.est_costs[n_i],
+						est_rank,
+						real_rank,
+					));
+				}
 			}
 		}
-	}
-	
-	Report {
-		metrics: bench.metrics,
-		samples: bench.plans,
-		chosen: bench.chosen_idx,
-		node_problems: problems,
-	}
+		
+		Report {
+			name: bench.name,
+			metrics: bench.metrics,
+			samples: bench.plans,
+			chosen: bench.chosen_idx,
+			node_problems: problems,
+		}
+	}).collect().await
 }
+	
 	

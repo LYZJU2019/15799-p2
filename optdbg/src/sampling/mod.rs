@@ -2,6 +2,8 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use futures::{Stream, StreamExt};
+
 use anyhow::Result;
 use async_recursion::async_recursion;
 use async_trait::async_trait;
@@ -614,7 +616,8 @@ pub struct SampleConfig;
 
 /// Output of sampler.
 pub struct SampleOutput {
-    /// Plan chosen by the query optimizer.
+	pub name: String,
+	/// Plan chosen by the query optimizer.
     pub best_plan: Plan,
     /// Alternative plans not chosen by the query optimizer.
     pub alternates: Vec<Plan>,
@@ -626,6 +629,7 @@ pub struct SampleOutput {
 
 /// Input to sampler.
 pub struct QueryInfo {
+	pub name: String, 
     /// Logical plan of query to optimize.
     pub plan: LogicalPlan,
     pub tables: Arc<dyn SchemaProvider>,
@@ -633,17 +637,26 @@ pub struct QueryInfo {
     pub state: SessionState,
 }
 
-pub async fn sample(mut query: QueryInfo, _cfg: SampleConfig) -> Result<SampleOutput> {
-    let backend = Arc::get_mut(&mut query.backend).unwrap();
-    let best = backend.get_best(&query.state, query.plan).await?;
-    let alts = backend.get_alternates(&query.state).await?;
-    // let alts = Vec::new();
+pub fn sample(
+	queries: impl Stream<Item = QueryInfo>,
+	_cfg: SampleConfig
+) -> impl Stream<Item = SampleOutput> {
+	queries.then(|mut query| async move {
+		let backend = Arc::get_mut(&mut query.backend).unwrap();
+		let best = backend.get_best(&query.state, query.plan).await?;
+		let alts = backend.get_alternates(&query.state).await?;
+		// let alts = Vec::new();
+		
+		println!("Found {} alternatives", alts.len());
 
-    println!("Found {} alternatives", alts.len());
-    Ok(SampleOutput {
-        best_plan: best,
-        alternates: alts,
-        session: query.state,
-        tables: query.tables,
-    })
+		Ok(SampleOutput {
+			name: query.name,
+			best_plan: best,
+			alternates: alts,
+			session: query.state,
+			tables: query.tables,
+		})
+	}).filter_map(|x: Result<SampleOutput>| async {
+		x.ok()
+	})
 }

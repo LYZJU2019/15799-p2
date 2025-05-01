@@ -2823,6 +2823,7 @@ dependencies = [
  "datafusion-dolomite-integration",
  "datafusion-proto",
  "dolomite",
+ "futures",
  "gag",
  "itertools 0.14.0",
  "optd-core",
