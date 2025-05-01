@@ -12,13 +12,9 @@ fn eq_plans(a: Arc<dyn ExecutionPlan>, b: Arc<dyn ExecutionPlan>) -> bool {
         return false;
     }
 
-    if a.as_any().type_id() != b.as_any().type_id() {
-        return false;
-    }
-
-    if !eq_properties(a.properties(), b.properties()) {
-        return false;
-    }
+    // if a.as_any().type_id() != b.as_any().type_id() {
+    //     return false;
+    // }
 
     let a_childs = a.children();
     let b_childs = b.children();
@@ -75,13 +71,13 @@ pub fn partial_eq_plans(
 	partial_eq_plans_help(a, b, &mut cur, target_i)
 }
 
-// TODO: not a complete comparison
-fn eq_properties(prop_a: &PlanProperties, prop_b: &PlanProperties) -> bool {
-    prop_a.boundedness == prop_b.boundedness
-        && prop_a.emission_type == prop_b.emission_type
-        && prop_a.partitioning == prop_b.partitioning
-        && prop_a.output_ordering() == prop_b.output_ordering()
-}
+// // TODO: not a complete comparison
+// fn eq_properties(prop_a: &PlanProperties, prop_b: &PlanProperties) -> bool {
+//     prop_a.boundedness == prop_b.boundedness
+//         && prop_a.emission_type == prop_b.emission_type
+//         && prop_a.partitioning == prop_b.partitioning
+//         && prop_a.output_ordering() == prop_b.output_ordering()
+// }
 
 impl Hash for Plan {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {

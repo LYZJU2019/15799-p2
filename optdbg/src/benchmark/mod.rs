@@ -347,12 +347,11 @@ async fn time_subplan_ipc(
 		.arg("-c").arg(cfg_file.path())
 		.arg("-s").arg(schema_file.path())
 		.arg("-o").arg(out_file.path())
-		.output()?;
+		.status()?;
 	
-	if !output.status.success() {
+	if !output.success() {
 		Ok(Err(MeasureError::Died))
 	} else {
-		println!("{}", String::from_utf8_lossy(&output.stdout));
 		let res: Option<(usize, Duration)> = serde_json::from_reader(out_file)?;
 		if let Some(measurements) = res {
 			Ok(Ok(measurements))
