@@ -450,7 +450,8 @@ impl OptdOldBackend {
             // NOTE: this blocks all println! calls! remember me when debugging!!
             let gag = gag::Gag::stdout().unwrap();
 
-            // Rebuilding optimizer is probably not necessary but it was the first thing that started working.
+			// Rebuilding optimizer is probably not necessary but it was
+			// the first thing that started working.
             let mut opt = if let Some(stats) = &self.stats {
                 new_physical_adv_cost(catalog.clone(), stats.clone(), false)
             } else {
