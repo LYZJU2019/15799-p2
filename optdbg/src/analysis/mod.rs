@@ -159,9 +159,7 @@ pub fn analyze(bench: BenchmarkOutput, _cfg: AnalysisConfig) -> Report {
 			let mut real_rank = 0;
 			for (j, oplan) in bench.plans.iter().enumerate() {
 				if i == j { continue }
-				println!("{i} {n_i} vs. {j}");
 				if partial_eq_plans(plan.plan.tree.clone(), oplan.plan.tree.clone(), n_i) {
-					println!("{i} {n_i} considering other candidate");
 					let Ok(oruntime) = oplan.sub_runtimes.as_ref().unwrap()[n_i] else {
 						continue
 					};
