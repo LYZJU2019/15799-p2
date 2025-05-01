@@ -83,6 +83,7 @@ impl Args {
 			BenchmarkConfig {
 				timeout: self.timeout.map(|x| x.0),
 				fast: self.fast,
+				enable_cache: true,
 			},
 			AnalysisConfig
 		)

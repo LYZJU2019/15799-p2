@@ -12,6 +12,7 @@ use futures::{Stream, StreamExt};
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use async_recursion::async_recursion;
+use child_wait_timeout::ChildWT;
 
 use crate::sampling::SampleOutput;
 use crate::common::{dump_plan, MeasureError, Plan, PlanMeasurements};
@@ -396,15 +397,6 @@ async fn measure_plan(
 	// FIXME temporary hack to get around OOMs. obviously not generic.
 	dump_plan(plan.tree.clone(), 0);
 	println!("{:?}", plan.est_costs);
-	if plan.est_costs[0] > 832146202382.0 {
-		let size = plan.size();
-		return Ok(MeasuredPlan {
-			plan,
-			runtime: Err(MeasureError::Died),
-			sub_runtimes: Some(vec![Err(MeasureError::Died); size]),
-			cardinalities: vec![Err(MeasureError::Died); size],
-		});
-	}
 	let mut idx = 0;
 	measure_subplan(plan.tree.clone(), ctx, cfg, &plan.est_costs, &mut idx,
 					&mut cardinalities, &mut runtimes, tables).await?;
@@ -480,10 +472,6 @@ async fn run_plan_ipc(
 	let mut plan_file = tempfile::NamedTempFile::new()?;
 	plan_file.write_all(&bytes)?;
 
-	let bytes = serde_json::to_string(cfg)?;
-	let mut cfg_file = tempfile::NamedTempFile::new()?;
-	cfg_file.write_all(bytes.as_bytes())?;
-
 	let mut schemas = Vec::new();
 	for i in tables.table_names() {
 		schemas.push((i.clone(), tables.table(&i).await?.unwrap().schema()));
@@ -494,22 +482,27 @@ async fn run_plan_ipc(
 	schema_file.write_all(bytes.as_bytes())?;
 	
 	let out_file = tempfile::NamedTempFile::new()?;
-	let output = std::process::Command::new("../optdbg/target/release/runner")
+
+	let mut child = std::process::Command::new("../optdbg/target/release/runner")
 		.arg("-p").arg(plan_file.path())
-		.arg("-c").arg(cfg_file.path())
 		.arg("-s").arg(schema_file.path())
-		.arg("-o").arg(out_file.path())
-		.status()?;
-	
-	if !output.success() {
-		Ok(Err(MeasureError::Died))
-	} else {
-		let res: Option<(usize, Duration)> = serde_json::from_reader(out_file)?;
-		if let Some(measurements) = res {
-			Ok(Ok(measurements))
-		} else {
-			Ok(Err(MeasureError::Timeout))
-		}
+		.arg("-o").arg(out_file.path()).spawn()?;
+
+	let status = if let Some(timeout) = cfg.timeout {
+		child.wait_timeout(timeout)
+	} else { child.wait() };
+
+	match status {
+		Ok(status) => {
+			if !status.success() {
+				Ok(Err(MeasureError::Died))
+			} else {
+				let res: (usize, Duration) = serde_json::from_reader(out_file)?;
+				Ok(Ok(res))
+			}
+		},
+		Err(e) if e.kind() == std::io::ErrorKind::TimedOut => Ok(Err(MeasureError::Timeout)),
+		Err(e) => Err(anyhow::anyhow!("subprocess error: {e}"))
 	}
 }
 

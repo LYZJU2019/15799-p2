@@ -33,5 +33,6 @@ thiserror = "2.0.12"
 rayon = "1.10.0"
 futures = "0.3.31"
 asciigraph = "0.10.1"
+child_wait_timeout = "0.1.0"
 
 
