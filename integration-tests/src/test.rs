@@ -23,7 +23,7 @@ async fn main() -> anyhow::Result<()> {
         // 1. Execute from top to bottom, skip all child nodes if parent node times out
         // 2. Added panic catching to prevent Arrow library errors from crashing the program
         // 3. Added hard timeout to ensure the task will terminate
-        timeout: Some(std::time::Duration::from_secs(2)),
+        timeout: Some(std::time::Duration::from_secs(10)),
         fast: false,
     };
 

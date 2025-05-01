@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use async_recursion::async_recursion;
 
 use crate::sampling::SampleOutput;
-use crate::common::{Plan, PlanMeasurements, MeasureError};
+use crate::common::{dump_plan, MeasureError, Plan, PlanMeasurements};
 
 #[derive(Serialize, Deserialize, Clone, Copy)]
 pub struct BenchmarkConfig {
@@ -251,10 +251,10 @@ async fn measure_subplan(
 ) -> anyhow::Result<()> {
 	// FIXME temporary hack
 	println!("est cost is {}", est_costs[*idx]);
-	if est_costs[*idx] > 1000000000000.0 || node.name() == "CrossJoinExec" {
-		cards.push(Err(MeasureError::Died));
-		times.push(Err(MeasureError::Died));
-	} else { 
+	// if est_costs[*idx] > 1000000000000.0 || node.name() == "CrossJoinExec" {
+	// 	cards.push(Err(MeasureError::Died));
+	// 	times.push(Err(MeasureError::Died));
+	// } else { 
 		println!("Timing subplan");
 		crate::common::dump_plan(node.clone(), 0);	
 		match time_subplan_ipc(node.clone(), cfg, tables.clone()).await? {
@@ -269,7 +269,7 @@ async fn measure_subplan(
 				times.push(Err(e));
 			}
 		}
-	}
+	// }
 	for child in node.children() {
 		*idx += 1;
 		measure_subplan(child.clone(), ctx.clone(), cfg, &est_costs,
@@ -291,6 +291,8 @@ async fn measure_plan(
 	let mut cardinalities = Vec::new();
 	let mut runtimes = Vec::new();
 	// FIXME temporary hack to get around OOMs. obviously not generic.
+	dump_plan(plan.tree.clone(), 0);
+	println!("{:?}", plan.est_costs);
 	if plan.est_costs[0] > 832146202382.0 {
 		let size = plan.size();
 		return Ok(MeasuredPlan {
@@ -576,6 +578,7 @@ pub fn benchmark(
 	cfg: BenchmarkConfig
 ) -> impl Stream<Item = BenchmarkOutput> {
 	samples.then(move |sample| async move {
+		println!("{} {}", sample.name, sample.alternates.len());
 		let ctx = sample.session.task_ctx();
 		let mut out = Vec::new();
 		// TODO best measurement should definitely be interleaved in to avoid

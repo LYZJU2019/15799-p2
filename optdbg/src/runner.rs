@@ -7,7 +7,9 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Instant, Duration};
 
+use futures::{StreamExt};
 use datafusion::arrow::datatypes::Schema;
+use datafusion::physical_plan::execute_stream;
 use datafusion::prelude::{ParquetReadOptions, SessionContext};
 use datafusion_proto::bytes::physical_plan_from_bytes;
 use optdbg::benchmark::BenchmarkConfig;
@@ -29,9 +31,18 @@ async fn time_subplan(
 		let (node, ctx) = (node.clone(), ctx.clone());
 		let blocking_task = tokio::task::spawn(async move {
 			let before = Instant::now();
-			let out = collect(node, ctx).await;
-			let after = Instant::now();
-			let _ = result_tx.send((out, after-before));
+			let out = execute_stream(node, ctx);
+			if let Ok(out) = out { 
+				let rows: Vec<_> = out
+					.filter_map(|x| async { x.ok() })
+					.then(|x| async move { x.num_rows() }).collect().await;
+				let res = rows.into_iter().sum();
+				let after = Instant::now();
+				let _ = result_tx.send((Some(res), after-before));
+			} else {
+				let after = Instant::now();
+				let _ = result_tx.send((None, after-before));
+			}
 		});
 		tokio::spawn(async move {
 			tokio::time::sleep(timeout).await;
@@ -40,8 +51,11 @@ async fn time_subplan(
 		tokio::select! {
 			result = result_rx => {
 				let (res, time) = result?;
-				let res = res?.iter().map(|x| x.num_rows()).sum();
-				Ok(Some((res, time)))
+				if let Some(res) = res { 
+					Ok(Some((res, time)))
+				} else {
+					Err(anyhow::anyhow!("exec err"))
+				}
 			}
 			_ = cancel_rx => {
 				Ok(None)
@@ -50,9 +64,12 @@ async fn time_subplan(
 	} else {
 		let (node, ctx) = (node.clone(), ctx.clone());
 		let before = Instant::now();
-		let out = collect(node, ctx).await;
+		let out = execute_stream(node, ctx);
+		let rows: Vec<_> = out?
+			.filter_map(|x| async { x.ok() })
+			.then(|x| async move { x.num_rows() }).collect().await;
+		let res = rows.into_iter().sum();
 		let after = Instant::now();
-		let res = out?.iter().map(|x| x.num_rows()).sum();
 		Ok(Some((res, after-before)))
 	}
 }

@@ -2,31 +2,16 @@ use std::time::Duration;
 use std::{hash::Hash, sync::Arc};
 
 use datafusion::physical_plan::{ExecutionPlan, PlanProperties};
+use datafusion_proto::bytes::physical_plan_to_bytes;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 // TODO find a way to compare plan properties?
 /// Returns true if two plans have same structure.
 fn eq_plans(a: Arc<dyn ExecutionPlan>, b: Arc<dyn ExecutionPlan>) -> bool {
-    if a.name() != b.name() {
-        return false;
-    }
-
-    // if a.as_any().type_id() != b.as_any().type_id() {
-    //     return false;
-    // }
-
-    let a_childs = a.children();
-    let b_childs = b.children();
-    if a_childs.len() != b_childs.len() {
-        return false;
-    }
-    for (i, j) in a_childs.into_iter().zip(b_childs.into_iter()) {
-        if !eq_plans(i.clone(), j.clone()) {
-            return false;
-        }
-    }
-    true
+	let bytes_a = physical_plan_to_bytes(a).unwrap();
+	let bytes_b = physical_plan_to_bytes(b).unwrap();
+	bytes_a == bytes_b
 }
 
 fn partial_eq_plans_help(
@@ -86,7 +71,7 @@ impl Hash for Plan {
 }
 
 /// Returns the number of nodes in a plan.
-fn plan_size(a: Arc<dyn ExecutionPlan>) -> usize {
+pub fn plan_size(a: Arc<dyn ExecutionPlan>) -> usize {
     1 + a
         .children()
         .into_iter()
