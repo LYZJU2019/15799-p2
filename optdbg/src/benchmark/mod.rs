@@ -71,177 +71,6 @@ impl MeasuredPlan {
 	}
 }
 
-/// Times a subplan's execution, giving up after a timeout.
-async fn time_subplan(
-	node: Arc<dyn ExecutionPlan>,
-	ctx: Arc<TaskContext>,
-	timeout: Option<Duration>,
-) -> anyhow::Result<Option<(Vec<RecordBatch>, Duration)>> {
-	// Ensure a timeout is set
-	let timeout = timeout.unwrap_or(Duration::from_secs(5));
-	// Calculate hard timeout (1.5 times the original timeout)
-	let hard_timeout = timeout.checked_add(timeout.checked_div(2).unwrap_or(Duration::from_millis(500))).unwrap_or(Duration::from_secs(10));
-	
-	// Start timing
-	let start = Instant::now();
-	
-	// Create two channels for communication
-	let (result_tx, result_rx) = tokio::sync::oneshot::channel();
-	let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
-	
-	// Start execution task
-	let handle = tokio::spawn(async move {
-		// Catch potential panics
-		let result = match tokio::task::spawn(async {
-			collect(node, ctx).await
-		}).await {
-			Ok(res) => res,
-			Err(e) => {
-				println!("Worker thread panicked: {}", e);
-				Err(datafusion::error::DataFusionError::Execution("Panic occurred during query execution".to_string()))
-			}
-		};
-		
-		// Send result (success or error)
-		let elapsed = start.elapsed();
-		let _ = result_tx.send((result, elapsed));
-	});
-	
-	// Start timeout task
-	tokio::spawn(async move {
-		tokio::time::sleep(timeout).await;
-		let _ = cancel_tx.send(());
-	});
-	
-	// Wait for result or timeout
-	tokio::select! {
-		result = result_rx => {
-			match result {
-				Ok((res, time)) => {
-					println!("Query completed in {:?}", time);
-					match res {
-						Ok(data) => Ok(Some((data, time))),
-						Err(e) => {
-							println!("Error during execution: {}", e);
-							Ok(None)
-						}
-					}
-				},
-				Err(e) => {
-					println!("Channel closed unexpectedly: {}", e);
-					Ok(None)
-				}
-			}
-		},
-		_ = cancel_rx => {
-			println!("Timeout reached, cancelling task");
-			handle.abort();
-			Ok(None)
-		},
-		// Hard timeout to ensure no indefinite waiting
-		_ = tokio::time::sleep(hard_timeout) => {
-			println!("Hard timeout reached");
-			handle.abort();
-			Ok(None)
-		}
-	}
-}
-
-/// Recursively populate cardinality and runtime arrays.
-// TODO need to be a *lot* more rigorous for the actual benchmarking here.
-// one option is to try and integrate an existing optimizer like criterion
-// or divan. Both of these don't really support usage as a library though...
-// Doing this properly is an easy way to surpass TAQO.
-//
-// The other major TODO (this is long term) is to support the `fast` option 
-// and implement the optimization in www.vldb.org/pvldb/vol2/vldb09-294.pdf
-#[async_recursion]
-async fn measure_subplan(
-	node: Arc<dyn ExecutionPlan>,
-	ctx: Arc<TaskContext>,
-	cfg: &BenchmarkConfig,
-	cards: &mut Vec<Result<usize, MeasureError>>,
-	times: &mut Vec<Result<Duration, MeasureError>>,
-) -> anyhow::Result<()> {
-	// First execute the current node
-	if let Some((batches, time)) = time_subplan(node.clone(), ctx.clone(), cfg.timeout).await? {
-		println!("\n=== Plan Execution Details ===");
-		println!("Number of batches received: {}", batches.len());
-		for (i, batch) in batches.iter().enumerate() {
-			println!("Batch {}: {} rows × {} columns", i, batch.num_rows(), batch.num_columns());
-		}
-		let cardinality: usize = batches.iter().map(|x| x.num_rows()).sum();
-		println!("Total cardinality: {}", cardinality);
-		println!("Execution time: {:?}", time);
-		println!("============================\n");
-		
-		// Push current node's result
-		cards.push(Ok(cardinality));
-		times.push(Ok(time));
-		
-		// If current node executed successfully, then process its children
-		for i in 0..node.children().len() {
-			let child = node.children()[i].clone();
-			measure_subplan(child, ctx.clone(), cfg, cards, times).await?;
-		}
-	} else {
-		// Current node timed out, no need to process children
-		cards.push(Err(MeasureError::Timeout));
-		times.push(Err(MeasureError::Timeout));
-		
-		// Use a non-recursive approach to mark all descendants as errors
-		// First, add all immediate children to our stack
-		let mut stack = Vec::new();
-		for i in 0..node.children().len() {
-			stack.push(node.children()[i].clone());
-		}
-		
-		// Process the stack until empty
-		while let Some(child_node) = stack.pop() {
-			// Mark this node as timeout error
-			cards.push(Err(MeasureError::Timeout));
-			times.push(Err(MeasureError::Timeout));
-			
-			// Add its children to the stack
-			for i in 0..child_node.children().len() {
-				stack.push(child_node.children()[i].clone());
-			}
-		}
-	}
-	Ok(())
-}
-
-/// Measure cardinalities and runtimes of plan and subplans.
-///
-/// Use `measure_ipc` for OOM safety (which is a real concern).
-// TODO think of a more consistent hack? do we bother keeping this at all?
-async fn measure_plan(
-	plan: Plan,
-	ctx: Arc<TaskContext>,
-	cfg: &BenchmarkConfig,
-) -> anyhow::Result<MeasuredPlan> {
-	let mut cardinalities = Vec::new();
-	let mut runtimes = Vec::new();
-	// FIXME temporary hack to get around OOMs. obviously not generic.
-	if plan.est_costs[0] < 1000000000.0 {
-		measure_subplan(plan.tree.clone(), ctx, cfg, &mut cardinalities, &mut runtimes).await?;
-	} else {
-		cardinalities.push(Err(MeasureError::Died));
-		runtimes.push(Err(MeasureError::Died));
-	}
-	if let Ok(runtime) = runtimes[0] {
-		println!("ran plan in {}ms (est cost {})", runtime.as_millis(), plan.est_costs[0]);
-	} else {
-		println!("plan timed out (est cost {})", plan.est_costs[0]);
-	}
-	Ok(MeasuredPlan {
-		plan,
-		runtime: runtimes[0],
-		cardinalities,
-		sub_runtimes: Some(runtimes),
-	})
-}
-
 // this version is for cross-process stuff...
 // but switching to `ListingTable`s kinda fixed OOM issues
 /// Measure cardinalities and runtimes of plan and subplans.
@@ -323,8 +152,15 @@ fn calculate_cost_rank_accuracy(plans: &[MeasuredPlan]) -> (f64, f64) {
 	// Find the best actual runtime for weight calculation (a1 in the paper)
 	let best_runtime = runtime_cost_pairs.iter()
 		.map(|(r, _)| *r)
-		.min()
-		.unwrap();
+		.min();
+	
+	// If all plans failed (no valid runtimes), return default values
+	if best_runtime.is_none() {
+		println!("Warning: All plans failed execution, returning default metrics");
+		return (0.0, 0.0); // Return default values indicating no valid metrics
+	}
+	
+	let best_runtime = best_runtime.unwrap();
 	
 	// Find min and max values for normalization (a_n, a_1, max(e_k), min(e_k))
 	let min_r = best_runtime.as_secs_f64(); // a1
