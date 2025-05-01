@@ -1,7 +1,7 @@
-use std::sync::Arc;
 use std::time::Duration;
+use std::{hash::Hash, sync::Arc};
 
-use datafusion::physical_plan::ExecutionPlan;
+use datafusion::physical_plan::{ExecutionPlan, PlanProperties};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -11,6 +11,15 @@ fn eq_plans(a: Arc<dyn ExecutionPlan>, b: Arc<dyn ExecutionPlan>) -> bool {
     if a.name() != b.name() {
         return false;
     }
+
+    if a.as_any().type_id() != b.as_any().type_id() {
+        return false;
+    }
+
+    if !eq_properties(a.properties(), b.properties()) {
+        return false;
+    }
+
     let a_childs = a.children();
     let b_childs = b.children();
     if a_childs.len() != b_childs.len() {
@@ -22,6 +31,20 @@ fn eq_plans(a: Arc<dyn ExecutionPlan>, b: Arc<dyn ExecutionPlan>) -> bool {
         }
     }
     true
+}
+
+// TODO: not a complete comparison
+fn eq_properties(prop_a: &PlanProperties, prop_b: &PlanProperties) -> bool {
+    prop_a.boundedness == prop_b.boundedness
+        && prop_a.emission_type == prop_b.emission_type
+        && prop_a.partitioning == prop_b.partitioning
+        && prop_a.output_ordering() == prop_b.output_ordering()
+}
+
+impl Hash for Plan {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        format!("{:?}", self.tree).hash(state);
+    }
 }
 
 /// Returns the number of nodes in a plan.
