@@ -89,10 +89,14 @@ impl std::fmt::Display for Report {
 			CardQuality::Unknown => 
 				writeln!(f, "Cardinality estimation cannot be evaluated"),
 		}?;
-		writeln!(f, "====================================================\n")?;
+		writeln!(f, "\n====================================================\n")?;
 		
 		for i in 0..self.samples.len() {
-			writeln!(f, "Plan {i}")?;
+			write!(f, "Plan {i}")?;
+			if i == self.chosen {
+				write!(f, " (CHOSEN)")?;
+			}
+			writeln!(f, "")?;
 			writeln!(f, "------------------")?;
 			self.dump_plan(f, i)?;
 		}
