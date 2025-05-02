@@ -681,7 +681,6 @@ impl OptdOldBackend {
             opt_ctx.optimizer = Some(&opt);
 
             for plan in plans {
-                println!("{plan}");
                 let mut costs = Vec::new();
                 let mut cards = Vec::new();
                 let mut visited = HashSet::new();

@@ -12,21 +12,17 @@ This tool will be built around the DataFusion physical plan representation, and 
 
 This tool also relies on access to the memo table of a query optimizer to sample the space of alternative query plans. In the context of `optd` this would mean hooking into the [`egest` module](https://github.com/cmu-db/optd/blob/connor/e2e/optd-core/src/optimizer/egest.rs) to export more than just the chosen plans for the query and all subplans. As DataFusion doesn't have clear support for optimizer hints nor an explicit Cascades-style optimizer, this tool can achieve a similar strategy by using the [`datafusion-dolomite` optimizer](https://github.com/datafusion-contrib/datafusion-dolomite) and extracting plans from the [`memo` structure](https://github.com/datafusion-contrib/datafusion-dolomite/blob/main/dolomite/src/cascades/memo.rs). We make many methods public inside the `memo.rs` and `tasks2.rs` files in the archived copy of optd.
 
-Furthermore, this tool also needs access to estimated costs of plans and subplans. We extract these from the cost model and the memo table
+Furthermore, this tool also needs access to estimated costs of plans and subplans. We extract these from the cost model and the memo table of optd.
 
 ## Architectural Design
 
 At the highest level, the component takes a compatible query optimizer and a set of SQL queries for evalution. It then outputs a report on which queries were misoptimized and why / how (alongside higher level information on the optimizer's performance e.g. how efficient it is). 
 
-![query](https://hackmd.io/_uploads/H1K77XfCyl.png)
+![query(1)](https://hackmd.io/_uploads/rkyAd3Gglg.png)
 
 There are three primary subcomponents: 
-- The **sampler** takes the input query and attempts to sample the space of possible plans for the query. This is the only subcomponent that directly interacts with the query optimizer being evaluated: it runs the optimizer on the query, gets the outputted plan, then extracts additional possible subplans/plans from the optimizer's memo table to get alternative plans.
+- The **sampler** takes the input query and attempts to sample the space of possible plans for the query. This is the only subcomponent that directly interacts with the query optimizer being evaluated: it runs the optimizer on the query, gets the outputted plan, then either extracts additional possible subplans/plans from the optimizer's memo table or reruns with to get alternative plans.
 
-  Abstractly, the "type signature" of this component would be
-```rust
-fn sample(query: String) -> Vec<Plan>
-```
 - The **benchmarker** takes the set of possible plans and runs each one of them using the DataFusion query engine (with a simple data source like Apache Arrow), measuring execution time and actual cardinality. It also runs all subplans to get the true cardinalities of each intermediate plan node. Then  "notable" plans (e.g. ones where the estimated cost is very different than the runtime performance) and higher level metrics such as the optimizer's efficiency are passed on by this component.
 
     The benchmarker component is designed to evaluate the performance and estimation accuracy of the query optimizer based on the following three dimensions:
