@@ -7,18 +7,14 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Instant, Duration};
 
-use futures::{StreamExt};
+use futures::StreamExt;
 use datafusion::arrow::datatypes::Schema;
 use datafusion::physical_plan::execute_stream;
 use datafusion::prelude::{ParquetReadOptions, SessionContext};
 use datafusion_proto::bytes::physical_plan_from_bytes;
-use optdbg::benchmark::BenchmarkConfig;
 
-use async_recursion::async_recursion;
 use clap::Parser;
-use datafusion::arrow::array::RecordBatch;
-use datafusion::{execution::TaskContext, physical_plan::{collect, ExecutionPlan}};
-use optdbg::common::{MeasureError, PlanMeasurements};
+use datafusion::{execution::TaskContext, physical_plan::ExecutionPlan};
 
 async fn time_subplan(
 	node: Arc<dyn ExecutionPlan>,
@@ -27,10 +23,11 @@ async fn time_subplan(
 	let (node, ctx) = (node.clone(), ctx.clone());
 	let before = Instant::now();
 	let out = execute_stream(node, ctx);
-	let rows: Vec<_> = out?
+	let res = out?
 		.filter_map(|x| async { x.ok() })
-		.then(|x| async move { x.num_rows() }).collect().await;
-	let res = rows.into_iter().sum();
+		// slight paranoia about unnecessary memory usage
+		.then(|ref x| { let rows = x.num_rows(); async move { rows }})
+		.fold(0, |acc, x| async move { acc + x }).await;
 	let after = Instant::now();
 	Ok((res, after-before))
 }
