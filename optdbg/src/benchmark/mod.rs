@@ -595,10 +595,6 @@ async fn run_plan_ipc(
 	let mut plan_file = tempfile::NamedTempFile::new()?;
 	plan_file.write_all(&bytes)?;
 
-	let bytes = serde_json::to_string(cfg)?;
-	let mut cfg_file = tempfile::NamedTempFile::new()?;
-	cfg_file.write_all(bytes.as_bytes())?;
-
 	let mut schemas = Vec::new();
 	for i in tables.table_names() {
 		schemas.push((i.clone(), tables.table(&i).await?.unwrap().schema()));
@@ -612,7 +608,6 @@ async fn run_plan_ipc(
 
 	let mut child = std::process::Command::new("../optdbg/target/release/runner")
 		.arg("-p").arg(plan_file.path())
-		.arg("-c").arg(cfg_file.path())
 		.arg("-s").arg(schema_file.path())
 		.arg("-o").arg(out_file.path())
 		.spawn()?;
@@ -904,6 +899,9 @@ pub fn benchmark(
 			.unwrap_or(out.len());
 		
 		out.insert(chosen_idx, best);
+		if !out.iter().any(|x| x.runtime.is_ok()) {
+			return Err(anyhow::anyhow!("no valid executions"));
+		}
 		
 		// Calculate cost rank accuracy
 		let (taqo_s, taqo_percent) = calculate_cost_rank_accuracy(&out);

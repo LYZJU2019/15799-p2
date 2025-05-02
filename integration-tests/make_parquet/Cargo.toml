@@ -1,0 +1,12 @@
+[package]
+name = "make_parquet"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.98"
+test-utils = { path = "../datafusion/test-utils" }
+csv2parquet = { path = "./arrow-tools/crates/csv2parquet" }
+glob = "0.3.2"
+datafusion-catalog = { path = "../datafusion/datafusion/catalog" }
+datafusion = { path = "../datafusion/datafusion/core" }

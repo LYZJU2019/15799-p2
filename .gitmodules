@@ -19,3 +19,6 @@
 [submodule "integration-tests/make_parquet/arrow-tools"]
 	path = integration-tests/make_parquet/arrow-tools
 	url = git@github.com:quantumish/arrow-tools.git
+[submodule "integration-tests/tpch-dbgen"]
+	path = integration-tests/tpch-dbgen
+	url = https://github.com/databricks/tpch-dbgen.git
