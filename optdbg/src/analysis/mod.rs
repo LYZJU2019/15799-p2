@@ -137,7 +137,8 @@ impl std::fmt::Display for QueryReport {
 		writeln!(f, "TAQO Accuracy: {:.2}% (higher is better)", self.metrics.taqo_accuracy_percent)?;
 		writeln!(f, "Performance Factor (PF): {:.2}%", self.metrics.performance_factor * 100.0)?;
 		writeln!(f, "Average Q-Error: {:.2} (closer to 1.0 is better)", self.metrics.avg_q_error)?;
-
+		writeln!(f, "\n{}", self.metrics.q_error_distribution.report())?;
+		
 		let mut perfgraph = Graph::default();
 		let data: Vec<_> = self.samples
 			.iter()

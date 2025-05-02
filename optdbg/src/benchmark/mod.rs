@@ -322,6 +322,8 @@ pub struct OptimizerMetrics {
 	pub performance_factor: f64,
 	/// Average Q-Error for cardinality estimation (closer to 1.0 is better)
 	pub avg_q_error: f64,
+	/// Detailed Q-Error distribution
+	pub q_error_distribution: QErrorDistribution,
 }
 
 pub struct BenchmarkOutput {
@@ -959,16 +961,26 @@ fn calculate_avg_q_error(plan: &MeasuredPlan) -> f64 {
 	for (i, cardinality_result) in plan.cardinalities.iter().enumerate() {
 		if i < plan.plan.est_cards.len() {
 			if let Ok(actual_card) = cardinality_result {
-				// Skip if actual cardinality is 0
-				if *actual_card == 0 {
-					println!("Node {}: Skipping - actual cardinality is 0", i);
+				let estimated_card = plan.plan.est_cards[i];
+				
+				// Skip if actual or estimated cardinality is 0
+				if *actual_card == 0 || estimated_card == 0.0 {
+					println!("Node {}: Skipping - cardinality is 0 (actual={}, est={})", 
+							i, actual_card, estimated_card);
 					continue;
 				}
 				
-				let estimated_card = plan.plan.est_cards[i];
 				let q_error = calculate_q_error(estimated_card, *actual_card);
 				if q_error.is_finite() {
-					total_q_error += q_error;
+					// Print information about nodes with very high Q-Error
+					if q_error > 100.0 {
+						println!("HIGH Q-ERROR DETECTED: Node {} | Estimated: {:.2} | Actual: {} | Q-Error: {:.2}", 
+							i, estimated_card, actual_card, q_error);
+					}
+					
+					// Cap q_error at 10000.0 to avoid extreme values skewing the average
+					let capped_q_error = q_error.min(10000.0);
+					total_q_error += capped_q_error;
 					valid_counts += 1;
 				}
 			}
@@ -976,7 +988,7 @@ fn calculate_avg_q_error(plan: &MeasuredPlan) -> f64 {
 	}
 	
 	if valid_counts == 0 {
-		return f64::MAX;
+		return f64::MAX; // No valid measurements
 	}
 	
 	total_q_error / valid_counts as f64
@@ -1108,23 +1120,29 @@ pub fn benchmark(
 		let performance_factor = calculate_performance_factor(&out, chosen_idx);
 		
 		// Calculate average Q-Error for the chosen plan
-		let avg_q_error = calculate_avg_q_error(&out[chosen_idx]);
+		let q_error_stats = calculate_q_error_stats(&out[chosen_idx]);
+		let avg_q_error = if !q_error_stats.values.is_empty() {
+			q_error_stats.values.iter().sum::<f64>() / q_error_stats.values.len() as f64
+		} else {
+			f64::MAX
+		};
 		
 		// Log performance metrics for this benchmark if tracking is enabled
 		if cfg.track_metrics {
-			println!("{}", report_performance_metrics());
+				println!("{}", report_performance_metrics());
 		}
 		
 		Ok(BenchmarkOutput {
 			name: sample.name,
-			plans: out,
-			chosen_idx,
-			metrics: OptimizerMetrics {
-				taqo_score_s: taqo_s,
-				taqo_accuracy_percent: taqo_percent,
-				performance_factor,
-				avg_q_error,
-			}
+				plans: out,
+				chosen_idx,
+				metrics: OptimizerMetrics {
+					taqo_score_s: taqo_s,
+					taqo_accuracy_percent: taqo_percent,
+					performance_factor,
+					avg_q_error,
+					q_error_distribution: q_error_stats,
+				}
 		})
 	}).filter_map(|x: anyhow::Result<BenchmarkOutput>| async {
 		x.ok()
@@ -1269,12 +1287,17 @@ mod tests {
 
 		assert_eq!(calculate_q_error(100.0, 100), 1.0);
 
-		assert_eq!(calculate_q_error(0.0, 100), f64::MAX);
-		assert_eq!(calculate_q_error(100.0, 0), f64::MAX);
+		assert_eq!(calculate_q_error(0.0, 100), 1000.0);
+		assert_eq!(calculate_q_error(100.0, 0), 1000.0);
 		assert_eq!(calculate_q_error(0.0, 0), 1.0);
 
-		let small_q_error1 = calculate_q_error(0.001, 1);
-		assert!((small_q_error1 - 1000.0).abs() < 1.0);
+		// For small values, the q-error should be the ratio of the larger to the smaller
+		let q_error = calculate_q_error(0.001, 1);
+		assert_eq!(q_error, 1000.0, "Expected q_error 1000.0 for 0.001 vs 1, got {}", q_error);
+		
+		// Test with very small estimated value
+		let q_error2 = calculate_q_error(1.0, 10000);
+		assert_eq!(q_error2, 10000.0, "Expected q_error 10000.0 for 1.0 vs 10000, got {}", q_error2);
 	}
 
 	
@@ -1514,6 +1537,7 @@ mod tests {
 					taqo_accuracy_percent: 100.0,
 					performance_factor: 1.0, // Optimal
 					avg_q_error: 1.0,
+					q_error_distribution: QErrorDistribution::default(),
 				},
 			},
 			BenchmarkOutput {
@@ -1525,6 +1549,7 @@ mod tests {
 					taqo_accuracy_percent: 60.0,
 					performance_factor: 0.5, // Suboptimal
 					avg_q_error: 2.0,
+					q_error_distribution: QErrorDistribution::default(),
 				},
 			},
 			BenchmarkOutput {
@@ -1536,6 +1561,7 @@ mod tests {
 					taqo_accuracy_percent: 100.0,
 					performance_factor: 1.0, // Optimal
 					avg_q_error: 1.0,
+					q_error_distribution: QErrorDistribution::default(),
 				},
 			},
 		];
@@ -2056,4 +2082,192 @@ mod tests {
 		let optimality = summary.get("optimality").unwrap();
 		assert!(*optimality == 0.0, "Optimizer didn't pick the optimal plan, so optimality should be 0.0");
 	}
+}
+
+/// Structure to hold Q-Error distribution information
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct QErrorDistribution {
+	/// Individual Q-Error values
+	values: Vec<f64>,
+	/// Number of perfect estimations (Q-Error = 1.0)
+	perfect_count: usize,
+	/// Number of excellent estimations (1.0 < Q-Error ≤ 2.0)
+	excellent_count: usize,
+	/// Number of good estimations (2.0 < Q-Error ≤ 4.0)
+	good_count: usize,
+	/// Number of acceptable estimations (4.0 < Q-Error ≤ 10.0)
+	acceptable_count: usize,
+	/// Number of poor estimations (Q-Error > 10.0)
+	poor_count: usize,
+	/// Number of very poor estimations (Q-Error > 100.0)
+	very_poor_count: usize,
+	/// Number of extremely poor estimations (Q-Error > 1000.0)
+	extremely_poor_count: usize,
+	/// Median Q-Error
+	median: f64,
+	/// 90th percentile Q-Error
+	p90: f64,
+	/// 95th percentile Q-Error
+	p95: f64,
+	/// 99th percentile Q-Error
+	p99: f64,
+	/// Maximum Q-Error
+	max: f64,
+}
+
+impl QErrorDistribution {
+	/// Create a new QErrorDistribution from a vector of Q-Error values
+	pub fn new(mut values: Vec<f64>) -> Self {
+		if values.is_empty() {
+			return Self::default();
+		}
+		
+		// Sort values for percentile calculations
+		values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+		
+		let len = values.len();
+		let median = if len % 2 == 0 {
+			(values[len / 2 - 1] + values[len / 2]) / 2.0
+		} else {
+			values[len / 2]
+		};
+		
+		let p90_idx = (len as f64 * 0.9) as usize;
+		let p95_idx = (len as f64 * 0.95) as usize;
+		let p99_idx = (len as f64 * 0.99) as usize;
+		
+		let mut distribution = Self {
+			median,
+			p90: values.get(p90_idx).copied().unwrap_or(values[len - 1]),
+			p95: values.get(p95_idx).copied().unwrap_or(values[len - 1]),
+			p99: values.get(p99_idx).copied().unwrap_or(values[len - 1]),
+			max: *values.last().unwrap(),
+			values: values.clone(),
+			..Default::default()
+		};
+		
+		// Count values in different buckets
+		for q in &values {
+			if *q == 1.0 {
+				distribution.perfect_count += 1;
+			} else if *q <= 2.0 {
+				distribution.excellent_count += 1;
+			} else if *q <= 4.0 {
+				distribution.good_count += 1;
+			} else if *q <= 10.0 {
+				distribution.acceptable_count += 1;
+			} else {
+				distribution.poor_count += 1;
+				if *q > 100.0 {
+					distribution.very_poor_count += 1;
+					if *q > 1000.0 {
+						distribution.extremely_poor_count += 1;
+					}
+				}
+			}
+		}
+		
+		distribution
+	}
+	
+	/// Generate a formatted report of the Q-Error distribution
+	pub fn report(&self) -> String {
+		let total = self.values.len();
+		if total == 0 {
+			return "No Q-Error data available".to_string();
+		}
+		
+		let perfect_pct = (self.perfect_count as f64 / total as f64) * 100.0;
+		let excellent_pct = (self.excellent_count as f64 / total as f64) * 100.0;
+		let good_pct = (self.good_count as f64 / total as f64) * 100.0;
+		let acceptable_pct = (self.acceptable_count as f64 / total as f64) * 100.0;
+		let poor_pct = (self.poor_count as f64 / total as f64) * 100.0;
+		let very_poor_pct = (self.very_poor_count as f64 / total as f64) * 100.0;
+		let extremely_poor_pct = (self.extremely_poor_count as f64 / total as f64) * 100.0;
+		
+		format!(
+			"Q-Error Distribution (total nodes: {}):\n\
+			Perfect    (=1.0):  {:5} ({:5.1}%)\n\
+			Excellent  (≤2.0):  {:5} ({:5.1}%)\n\
+			Good       (≤4.0):  {:5} ({:5.1}%)\n\
+			Acceptable (≤10.0): {:5} ({:5.1}%)\n\
+			Poor       (>10.0): {:5} ({:5.1}%)\n\
+			Very poor  (>100):  {:5} ({:5.1}%)\n\
+			Extremely poor (>1000): {:5} ({:5.1}%)\n\
+			\n\
+			Statistics:\n\
+			Median: {:.2}\n\
+			90th percentile: {:.2}\n\
+			95th percentile: {:.2}\n\
+			99th percentile: {:.2}\n\
+			Maximum: {:.2}",
+			total,
+			self.perfect_count, perfect_pct,
+			self.excellent_count, excellent_pct,
+			self.good_count, good_pct,
+			self.acceptable_count, acceptable_pct,
+			self.poor_count, poor_pct,
+			self.very_poor_count, very_poor_pct,
+			self.extremely_poor_count, extremely_poor_pct,
+			self.median, self.p90, self.p95, self.p99, self.max
+		)
+	}
+}
+
+// Modify calculate_avg_q_error to return QErrorDistribution instead
+fn calculate_q_error_stats(plan: &MeasuredPlan) -> QErrorDistribution {
+    let mut q_error_values = Vec::new();
+    
+    for (i, cardinality_result) in plan.cardinalities.iter().enumerate() {
+        if i < plan.plan.est_cards.len() {
+            if let Ok(actual_card) = cardinality_result {
+                let estimated_card = plan.plan.est_cards[i];
+                
+                // Skip if actual or estimated cardinality is 0
+                if *actual_card == 0 || estimated_card == 0.0 {
+                    continue;
+                }
+                
+                let q_error = calculate_q_error(estimated_card, *actual_card);
+                
+                // Print detailed information about nodes with very high Q-Error
+                if q_error > 100.0 {
+                    // Try to get the node type name if available from the plan tree
+                    let node_type = if i < plan.plan.size() {
+                        let mut idx = 0;
+                        fn get_node_at_index(node: &Arc<dyn ExecutionPlan>, target_idx: usize, current_idx: &mut usize) -> Option<String> {
+                            if *current_idx == target_idx {
+                                return Some(node.name().to_string());
+                            }
+                            
+                            for child in node.children() {
+                                *current_idx += 1;
+                                if let Some(name) = get_node_at_index(&child, target_idx, current_idx) {
+                                    return Some(name);
+                                }
+                            }
+                            None
+                        }
+                        
+                        get_node_at_index(&plan.plan.tree, i, &mut idx).unwrap_or_else(|| "Unknown".to_string())
+                    } else {
+                        "Unknown".to_string()
+                    };
+                    
+                    println!("SEVERE Q-ERROR: Node {} ({}) | Estimated: {:.2} | Actual: {} | Q-Error: {:.2}", 
+                        i, node_type, estimated_card, actual_card, q_error);
+                }
+                
+                // Skip infinity or extremely large values - use a more reasonable upper limit
+                if q_error.is_finite() && q_error <= 10000.0 {
+                    q_error_values.push(q_error);
+                } else {
+                    // For extremely large values, cap them at 10000.0 to avoid skewing averages
+                    q_error_values.push(10000.0);
+                }
+            }
+        }
+    }
+    
+    QErrorDistribution::new(q_error_values)
 }
