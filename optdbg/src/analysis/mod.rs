@@ -21,6 +21,16 @@ pub enum NodeProblem {
 	CostMisestimation(u128, f64, usize, usize),
 }
 
+impl ToString for NodeProblem {
+	fn to_string(&self) -> String {
+		match self {
+			Self::Crash => "crash".to_string(),
+			Self::CardinalityMisestimation(..) => "cardinality_misestimation".to_string(),
+			Self::CostMisestimation(..) => "cost_misestimation".to_string(),
+		}
+	}
+}
+
 pub struct Report {
 	/// Optimality Frequency (OF) - fraction of queries for which the optimizer chooses the relative optimal plan
 	pub opt_freq: f64,
@@ -31,8 +41,9 @@ pub struct Report {
 }
 
 pub struct QueryReport {
-	node_problem_frequency: HashMap<String, (usize, usize)>,
-	pred_problem_frequency: HashMap<String, (usize, usize)>,
+	// map of {node_type: ({problem_name: (too_low, too_high)}, total)}
+	node_problem_frequency: HashMap<String, (HashMap<String, (usize, usize)>, usize)>,
+	pred_problem_frequency: HashMap<String, (HashMap<String, (usize, usize)>, usize)>,
 	pub optimal_chosen: bool,
 	pub name: String,
 	pub metrics: OptimizerMetrics,
@@ -233,13 +244,66 @@ fn get_pred_nodes(node: Arc<dyn ExecutionPlan>) -> HashSet<String> {
 	expr_nodes.into_iter().collect()
 }
 
+fn insert_probs_into_thing(
+	node_freqs: &mut HashMap<String, (HashMap<String, (usize, usize)>, usize)>,
+	plan_idx: usize,
+	node_idx: &mut usize,
+	name: String,
+	problems: &HashMap<usize, HashMap<usize, Vec<NodeProblem>>>,
+) {
+	if let Some(entry) = node_freqs.get_mut(&name) {
+		entry.1 += 1;
+		if let Some(probs) = problems.get(&plan_idx)
+			.and_then(|x| x.get(node_idx))
+			.map(|x| x.iter().filter(|x| !matches!(x, NodeProblem::Crash)))
+		{
+			for prob in probs {
+				let under = match prob {
+					NodeProblem::CostMisestimation(_, _, x, y) => x > y,
+					NodeProblem::CardinalityMisestimation(x, y, _) => x < y,
+					NodeProblem::Crash => unreachable!()
+				};
+				if let Some(entry) = entry.0.get_mut(&prob.to_string()) {
+					if under { entry.0 += 1 } else { entry.1 += 1 }
+				} else {
+					if under {
+						entry.0.insert(prob.to_string(), (1, 0));
+					} else {
+						entry.0.insert(prob.to_string(), (0, 1));
+					}
+				}
+			}
+		}	
+	} else {
+		let mut prob_map = HashMap::new();
+		if let Some(probs) = problems.get(&plan_idx)
+			.and_then(|x| x.get(node_idx))
+			.map(|x| x.iter().filter(|x| !matches!(x, NodeProblem::Crash)))
+		{
+			for prob in probs {
+				let under = match prob {
+					NodeProblem::CostMisestimation(_, _, x, y) => x > y,
+					NodeProblem::CardinalityMisestimation(x, y, _) => x < y,
+					NodeProblem::Crash => unreachable!()
+				};
+				if under {
+					prob_map.insert(prob.to_string(), (1, 0));
+				} else {
+					prob_map.insert(prob.to_string(), (0, 1));
+				}
+			}
+		}	
+		node_freqs.insert(name, (prob_map, 1));
+	}
+}
+
 fn collect_freq_info(
 	plan_idx: usize,
 	node_idx: &mut usize,
 	node: Arc<dyn ExecutionPlan>,
 	problems: &HashMap<usize, HashMap<usize, Vec<NodeProblem>>>,
-	node_freqs: &mut HashMap<String, (usize, usize)>,
-	pred_freqs: &mut HashMap<String, (usize, usize)>,
+	node_freqs: &mut HashMap<String, (HashMap<String, (usize, usize)>, usize)>,
+	pred_freqs: &mut HashMap<String, (HashMap<String, (usize, usize)>, usize)>,
 	root_only: bool,
 ) -> bool {
 	// Do not process crashed nodes! 
@@ -257,11 +321,6 @@ fn collect_freq_info(
 		return false;
 	}	
 	
-	let mut has_problem = problems.get(&plan_idx)
-		.and_then(|x| x.get(node_idx))
-		.and_then(|x| x.iter().filter(|x| !matches!(x, NodeProblem::Crash)).next())
-		.is_some();
-	
 	let mut bad_child = false;
 	for c in node.children() {
 		*node_idx += 1;
@@ -269,23 +328,18 @@ fn collect_freq_info(
 			collect_freq_info(plan_idx, node_idx, c.clone(),
 							  problems, node_freqs, pred_freqs, root_only);
 	}
-	let true_has_problem = has_problem;
-	if root_only && bad_child {
-		has_problem = false;
-	}
-	if let Some(entry) = node_freqs.get_mut(node.name()) {
-		*entry = (entry.0 + if has_problem { 1 } else { 0 }, entry.1 + 1);
-	} else {
-		node_freqs.insert(node.name().to_string(), (if has_problem { 1 } else { 0 }, 1));
-	}
-	for pred_kind in get_pred_nodes(node.clone()) {
-		if let Some(entry) = pred_freqs.get_mut(&pred_kind) {
-			*entry = (entry.0 + if has_problem { 1 } else { 0 }, entry.1 + 1);
-		} else {
-			pred_freqs.insert(pred_kind, (if has_problem { 1 } else { 0 }, 1));
+	
+	if !(root_only && bad_child) {
+		insert_probs_into_thing(node_freqs, plan_idx, node_idx, node.name().to_string(), problems);
+	
+		for pred_kind in get_pred_nodes(node.clone()) {
+			insert_probs_into_thing(pred_freqs, plan_idx, node_idx, pred_kind, problems);
 		}
 	}
-	return true_has_problem;
+	return problems.get(&plan_idx)
+		.and_then(|x| x.get(node_idx))
+		.and_then(|x| x.iter().filter(|x| !matches!(x, NodeProblem::Crash)).next())
+		.is_some();
 }
 
 pub async fn analyze(
