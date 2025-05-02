@@ -5,7 +5,7 @@ use futures::{Stream, StreamExt};
 use itertools::Itertools;
 
 use crate::{
-	benchmark::{calculate_q_error, BenchmarkOutput, CardQuality, MeasuredPlan, OptimizerMetrics},
+	benchmark::{calculate_q_error, BenchmarkOutput, CardQuality, MeasuredPlan, OptimizerMetrics, RuntimeStats},
 	common::{partial_eq_plans, MeasureError}
 };
 
@@ -19,6 +19,41 @@ pub enum NodeProblem {
 	Crash,
 	CardinalityMisestimation(usize, usize, f64),
 	CostMisestimation(u128, f64, usize, usize),
+}
+
+#[derive(Debug)]
+pub enum MisestimationKind {
+	Under,
+	Over,
+	Either
+}
+
+impl MisestimationKind {
+	fn from_counts(over: usize, under: usize) -> Self {
+		if over as f64 > ((over+under) as f64 * 0.75) {
+			MisestimationKind::Over
+		} else if under as f64 > ((over+under) as f64 * 0.75) {
+			MisestimationKind::Under
+		} else {
+			MisestimationKind::Either
+		}
+	}
+}
+
+impl ToString for MisestimationKind {
+	fn to_string(&self) -> String {
+		match self {
+			Self::Under => "under".to_string(),
+			Self::Over => "over".to_string(),
+			Self::Either => "either".to_string(),
+		}
+	}
+}
+
+#[derive(Debug)]
+pub enum ReportedProblem {
+	Cardinality(MisestimationKind),
+	Cost(MisestimationKind),
 }
 
 impl ToString for NodeProblem {
@@ -42,6 +77,25 @@ pub struct Report {
 	pub global_node_problems: HashMap<String, (HashMap<String, (usize, usize)>, usize)>,
 	/// Global predicate problem frequency across all queries
 	pub global_pred_problems: HashMap<String, (HashMap<String, (usize, usize)>, usize)>,
+}
+
+impl Report {
+	pub fn report_problems(&self) -> Vec<(String, ReportedProblem)> {
+		let mut out = Vec::new();
+		for (name, (pmap, total)) in &self.global_node_problems {
+			for (prob, (under, over)) in pmap {
+				if over + under > *total/2 {
+					let kind = MisestimationKind::from_counts(*over, *under);
+					out.push((name.to_string(), match prob.as_str() {
+						"cardinality_misestimation" => ReportedProblem::Cardinality(kind),
+						"cost_misestimation" => ReportedProblem::Cost(kind),
+						_ => unreachable!(),
+					}));
+				}
+			}
+		}
+		out
+	}
 }
 
 pub struct QueryReport {
@@ -99,17 +153,7 @@ impl QueryReport {
 			idx,
 			&mut node_idx
 		)
-	}
-
-	// Add a method to get node problem frequency
-	pub fn node_problems(&self) -> &HashMap<String, (HashMap<String, (usize, usize)>, usize)> {
-		&self.node_problem_frequency
-	}
-	
-	// Add a method to get predicate problem frequency
-	pub fn pred_problems(&self) -> &HashMap<String, (HashMap<String, (usize, usize)>, usize)> {
-		&self.pred_problem_frequency
-	}
+	}	
 }
 
 impl std::fmt::Display for Report {
@@ -120,6 +164,8 @@ impl std::fmt::Display for Report {
 		writeln!(f, "Average TAQO Score (s): {:.4} (lower is better)", self.avg_taqo_score)?;
 		writeln!(f, "Average TAQO Accuracy: {:.2}% (higher is better)", self.avg_taqo_acc)?;
 		writeln!(f, "Average Performance Factor (PF): {:.2}%", self.avg_perf_factor * 100.0)?;
+		writeln!(f, "Global node perf problems {:?}", self.global_node_problems)?;
+		writeln!(f, "Global pred perf problems {:?}", self.global_pred_problems)?;
 		writeln!(f, "\n====================================================\n\n")?;
 		for q in &self.queries {
 			writeln!(f, "{q}")?;
@@ -263,7 +309,7 @@ fn insert_probs_into_thing(
 	node_idx: usize,
 	name: String,
 	problems: &HashMap<usize, HashMap<usize, Vec<NodeProblem>>>,
-) {
+) {	
 	if let Some(entry) = node_freqs.get_mut(&name) {
 		entry.1 += 1;
 		if let Some(probs) = problems.get(&plan_idx)
@@ -314,6 +360,7 @@ fn collect_freq_info(
 	plan_idx: usize,
 	node_idx: &mut usize,
 	node: Arc<dyn ExecutionPlan>,
+	runtimes: &Vec<Result<RuntimeStats, MeasureError>>,
 	problems: &HashMap<usize, HashMap<usize, Vec<NodeProblem>>>,
 	node_freqs: &mut HashMap<String, (HashMap<String, (usize, usize)>, usize)>,
 	pred_freqs: &mut HashMap<String, (HashMap<String, (usize, usize)>, usize)>,
@@ -323,12 +370,12 @@ fn collect_freq_info(
 	let just_crash = problems.get(&plan_idx)
 		.and_then(|x| x.get(node_idx))
 		.map(|x| x.len() == 1 && matches!(x[0], NodeProblem::Crash));
-	if let Some(true) = just_crash {
+	if let (Err(_), Some(true)) = (&runtimes[*node_idx], just_crash) {
 		// There may be live nodes below this depending on if early stopping was enabled.
 		// Code duplication here is annoying but not worth a refactor.
 		for c in node.children() {
 			*node_idx += 1;
-			collect_freq_info(plan_idx, node_idx, c.clone(),
+			collect_freq_info(plan_idx, node_idx, c.clone(), runtimes,
 							  problems, node_freqs, pred_freqs, root_only);
 		}
 		return false;
@@ -337,7 +384,7 @@ fn collect_freq_info(
 	let mut bad_child = false;
 	for c in node.children() {
 		*node_idx += 1;
-		let out = collect_freq_info(plan_idx, node_idx, c.clone(),
+		let out = collect_freq_info(plan_idx, node_idx, c.clone(), runtimes,
 							  problems, node_freqs, pred_freqs, root_only);
 		bad_child = bad_child || out;
 	}
@@ -440,6 +487,7 @@ pub async fn analyze(
 		for (i, plan) in bench.plans.iter().enumerate() {
 			let mut node_idx = 0;
 			collect_freq_info(i, &mut node_idx, plan.plan.tree.clone(),
+							  plan.sub_runtimes.as_ref().unwrap(),
 							  &problems, &mut node_freq, &mut pred_freq,
 							  cfg.root_problems_only);
 		}
@@ -457,10 +505,10 @@ pub async fn analyze(
 	}).collect().await;
 
 	let global_node_problems = combine_problem_maps(
-		queries.iter().map(|q| q.node_problems()).collect()
+		queries.iter().map(|q| &q.node_problem_frequency).collect()
 	);
 	let global_pred_problems = combine_problem_maps(
-		queries.iter().map(|q| q.pred_problems()).collect()
+		queries.iter().map(|q| &q.pred_problem_frequency).collect()
 	);
 
 	Report {

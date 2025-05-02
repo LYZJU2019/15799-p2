@@ -1,20 +1,24 @@
 use std::sync::Arc;
+use std::time::Instant;
 use futures::StreamExt;
 use datafusion::execution::context::{SessionConfig, SessionContext};
 use datafusion::prelude::ParquetReadOptions;
-use datafusion_expr::LogicalPlan;
+use optdbg::analysis::Report;
 use optdbg::sampling::{OptdOldBackend, RuleBailStrategy, SampleStrategy};
 use optdbg::{
     analysis::AnalysisConfig,
-    benchmark::{BenchmarkConfig, reset_performance_metrics, report_performance_metrics},
+    benchmark::BenchmarkConfig,
     sampling::{QueryInfo, SampleConfig},
 };
 use test_utils::tpch::tpch_schemas;
 
-pub async fn run_benchmark_with_config(config: BenchmarkConfig, data_dir: &str, queries_dir: &str) -> anyhow::Result<()> {
+pub async fn run_benchmark_with_config(
+	config: BenchmarkConfig, data_dir: &str,
+	queries_dir: &str, adv_cost: bool, root_only: bool
+) -> anyhow::Result<Report> {
     let s_cfg = SampleConfig;
     let a_cfg = AnalysisConfig {
-        root_problems_only: true,
+        root_problems_only: root_only,
     };
 
     let df_ctx = SessionContext::new_with_config(SessionConfig::default());
@@ -74,7 +78,7 @@ pub async fn run_benchmark_with_config(config: BenchmarkConfig, data_dir: &str, 
                         tables.clone(),
                         table_paths,
                         SampleStrategy::RuleBased(RuleBailStrategy::Never),
-                        false,
+                        adv_cost,
                     )
                         .await?,
                 ),
@@ -90,10 +94,6 @@ pub async fn run_benchmark_with_config(config: BenchmarkConfig, data_dir: &str, 
     });
     
     let report = optdbg::report_query(stream, s_cfg, config, a_cfg).await?;
-    println!("{report}");
-    
-    // Report final performance metrics
-    println!("{}", report_performance_metrics());
-
-    Ok(())
+	
+    Ok(report)
 }

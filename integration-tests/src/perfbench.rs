@@ -1,12 +1,23 @@
-use std::io::Write;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 mod lib;
 use lib::run_benchmark_with_config;
+use optdbg::benchmark::{BenchmarkConfig, reset_performance_metrics, report_performance_metrics};
+
+use clap::Parser;
+
+#[derive(Parser)]
+#[command(version, about, long_about = None)]
+struct Args {
+    /// Whether or not to use the advanced cost model for optd
+    #[arg(short, long)]
+    adv_cost: bool,
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+	let args = Args::parse();
+	
     // Get data directory from environment variable or use default
     let data_dir = std::env::var("OPTDBG_DATA_DIR").unwrap_or_else(|_| "./tpch-data".to_string());
     // Get queries directory from environment variable or use default
@@ -36,8 +47,11 @@ async fn main() -> anyhow::Result<()> {
     
     let start1 = Instant::now();
     reset_performance_metrics();
-    run_benchmark_with_config(config1, &data_dir, &queries_dir).await?;
+    let report = run_benchmark_with_config(config1, &data_dir,
+										   &queries_dir, args.adv_cost, true).await?;
     let duration1 = start1.elapsed();
+	println!("{report}");
+    println!("{}", report_performance_metrics());
     println!("Configuration 1 total time: {:.2}s", duration1.as_secs_f64());
     
     // Test 2: Without caching (to measure cache impact)
@@ -55,8 +69,11 @@ async fn main() -> anyhow::Result<()> {
     
     let start2 = Instant::now();
     reset_performance_metrics();
-    run_benchmark_with_config(config2, &data_dir, &queries_dir).await?;
+    let report = run_benchmark_with_config(config2, &data_dir,
+										   &queries_dir, args.adv_cost, true).await?;
     let duration2 = start2.elapsed();
+	println!("{report}");
+    println!("{}", report_performance_metrics());
     println!("Configuration 2 total time: {:.2}s", duration2.as_secs_f64());
     
     // Test 3: Without early stopping (to measure early stopping impact)
@@ -74,8 +91,11 @@ async fn main() -> anyhow::Result<()> {
     
     let start3 = Instant::now();
     reset_performance_metrics();
-    run_benchmark_with_config(config3, &data_dir, &queries_dir).await?;
+    let report = run_benchmark_with_config(config3, &data_dir,
+										   &queries_dir, args.adv_cost, true).await?;
     let duration3 = start3.elapsed();
+	println!("{report}");
+    println!("{}", report_performance_metrics());
     println!("Configuration 3 total time: {:.2}s", duration3.as_secs_f64());
     
     // Performance summary

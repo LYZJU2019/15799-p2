@@ -1,0 +1,13 @@
+diff --git a/optd_og-datafusion-repr-adv-cost/src/adv_stats/filter/like.rs b/optd_og-datafusion-repr-adv-cost/src/adv_stats/filter/like.rs
+index 1b1763c..5085c44 100644
+--- a/optd_og-datafusion-repr-adv-cost/src/adv_stats/filter/like.rs
++++ b/optd_og-datafusion-repr-adv-cost/src/adv_stats/filter/like.rs
+@@ -47,6 +47,8 @@ impl<
+         like_expr: &LikePred,
+         column_refs: &BaseTableColumnRefs,
+     ) -> f64 {
++		return 0.001;
++
+         let child = like_expr.child();
+ 
+         // Check child is a column ref.

@@ -1,0 +1,13 @@
+diff --git a/optd_og-datafusion-repr-adv-cost/src/adv_stats/join.rs b/optd_og-datafusion-repr-adv-cost/src/adv_stats/join.rs
+index cc7b654..7fccbf8 100644
+--- a/optd_og-datafusion-repr-adv-cost/src/adv_stats/join.rs
++++ b/optd_og-datafusion-repr-adv-cost/src/adv_stats/join.rs
+@@ -87,7 +87,7 @@ impl<
+                 left_col_cnt,
+             )
+         };
+-        (left_row_cnt * right_row_cnt * selectivity).max(1.0)
++        (left_row_cnt * right_row_cnt * selectivity * 0.05).max(1.0)
+     }
+ 
+     fn get_input_correlation(

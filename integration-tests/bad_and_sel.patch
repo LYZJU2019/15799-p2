@@ -1,0 +1,13 @@
+diff --git a/optd_og-datafusion-repr-adv-cost/src/adv_stats/filter.rs b/optd_og-datafusion-repr-adv-cost/src/adv_stats/filter.rs
+index fc2143f..f1b33cc 100644
+--- a/optd_og-datafusion-repr-adv-cost/src/adv_stats/filter.rs
++++ b/optd_og-datafusion-repr-adv-cost/src/adv_stats/filter.rs
+@@ -172,7 +172,7 @@ impl<
+             .map(|expr| self.get_filter_selectivity(expr.clone(), schema, column_refs));
+ 
+         match log_op_typ {
+-            LogOpType::And => children_sel.product(),
++            LogOpType::And => children_sel.sum(),
+             // the formula is 1.0 - the probability of _none_ of the events happening
+             LogOpType::Or => 1.0 - children_sel.fold(1.0, |acc, sel| acc * (1.0 - sel)),
+         }

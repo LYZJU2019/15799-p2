@@ -1,0 +1,22 @@
+diff --git a/optd_og-datafusion-repr-adv-cost/src/adv_stats/join.rs b/optd_og-datafusion-repr-adv-cost/src/adv_stats/join.rs
+index cc7b654..a027e9d 100644
+--- a/optd_og-datafusion-repr-adv-cost/src/adv_stats/join.rs
++++ b/optd_og-datafusion-repr-adv-cost/src/adv_stats/join.rs
+@@ -39,7 +39,7 @@ impl<
+         left_column_refs: GroupColumnRefs,
+         right_column_refs: GroupColumnRefs,
+     ) -> f64 {
+-        let selectivity = {
++        let _selectivity = {
+             let input_correlation = self.get_input_correlation(left_column_refs, right_column_refs);
+             self.get_join_selectivity_from_expr_tree(
+                 join_typ,
+@@ -51,7 +51,7 @@ impl<
+                 right_row_cnt,
+             )
+         };
+-        (left_row_cnt * right_row_cnt * selectivity).max(1.0)
++        (left_row_cnt * right_row_cnt).max(1.0)
+     }
+ 
+     #[allow(clippy::too_many_arguments)]
