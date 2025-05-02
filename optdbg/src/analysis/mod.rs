@@ -234,9 +234,7 @@ fn get_pred_nodes(node: Arc<dyn ExecutionPlan>) -> HashSet<String> {
 		"FilterExec" => {
 			let filter: &FilterExec = node.as_any().downcast_ref().unwrap();
 			let pred = filter.predicate();
-			println!("Filter with predicate {:?}", pred);
 			get_pred_nodes_expr(pred.clone(), &mut expr_nodes);
-			println!("Got nodes {:?}", expr_nodes);
 		},
 		"HashJoinExec" => {
 			let join: &HashJoinExec = node.as_any().downcast_ref().unwrap();
@@ -262,14 +260,14 @@ fn get_pred_nodes(node: Arc<dyn ExecutionPlan>) -> HashSet<String> {
 fn insert_probs_into_thing(
 	node_freqs: &mut HashMap<String, (HashMap<String, (usize, usize)>, usize)>,
 	plan_idx: usize,
-	node_idx: &mut usize,
+	node_idx: usize,
 	name: String,
 	problems: &HashMap<usize, HashMap<usize, Vec<NodeProblem>>>,
 ) {
 	if let Some(entry) = node_freqs.get_mut(&name) {
 		entry.1 += 1;
 		if let Some(probs) = problems.get(&plan_idx)
-			.and_then(|x| x.get(node_idx))
+			.and_then(|x| x.get(&node_idx))
 			.map(|x| x.iter().filter(|x| !matches!(x, NodeProblem::Crash)))
 		{
 			for prob in probs {
@@ -292,7 +290,7 @@ fn insert_probs_into_thing(
 	} else {
 		let mut prob_map = HashMap::new();
 		if let Some(probs) = problems.get(&plan_idx)
-			.and_then(|x| x.get(node_idx))
+			.and_then(|x| x.get(&node_idx))
 			.map(|x| x.iter().filter(|x| !matches!(x, NodeProblem::Crash)))
 		{
 			for prob in probs {
@@ -339,16 +337,16 @@ fn collect_freq_info(
 	let mut bad_child = false;
 	for c in node.children() {
 		*node_idx += 1;
-		bad_child = bad_child ||
-			collect_freq_info(plan_idx, node_idx, c.clone(),
+		let out = collect_freq_info(plan_idx, node_idx, c.clone(),
 							  problems, node_freqs, pred_freqs, root_only);
+		bad_child = bad_child || out;
 	}
-	
+
 	if !(root_only && bad_child) {
-		insert_probs_into_thing(node_freqs, plan_idx, node_idx, node.name().to_string(), problems);
+		insert_probs_into_thing(node_freqs, plan_idx, *node_idx, node.name().to_string(), problems);
 	
 		for pred_kind in get_pred_nodes(node.clone()) {
-			insert_probs_into_thing(pred_freqs, plan_idx, node_idx, pred_kind, problems);
+			insert_probs_into_thing(pred_freqs, plan_idx, *node_idx, pred_kind, problems);
 		}
 	}
 	return problems.get(&plan_idx)
