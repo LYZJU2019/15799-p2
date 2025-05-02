@@ -22,13 +22,13 @@ use datafusion::parquet::arrow::arrow_reader::{
 use datafusion_dolomite_integration::conversion as dolomite_conversion;
 use dolomite::cascades::CascadesOptimizer as DolomiteCascadesOptimizer;
 use dolomite::optimizer::Optimizer;
-use itertools::Itertools;
-use optd_og_core::cascades::{ExprId, GroupId};
-use optd_og_core::cost::Cost;
-use optd_og_core::nodes::{PlanNode, PlanNodeMeta, PlanNodeMetaMap, PlanNodeOrGroup};
+use itertools::{CircularTupleWindows, Itertools};
+use optd_og_core::cascades::{ExprId, GroupId, RelNodeContext};
+use optd_og_core::cascades::{Memo};
+use optd_og_core::cost::{Cost, Statistics};
+use optd_og_core::nodes::{ArcPredNode, PlanNode, PlanNodeMeta, PlanNodeMetaMap, PlanNodeOrGroup};
 use optd_og_core::{
-    cascades::{CascadesOptimizer as OptdCascadesOptimizer, Memo},
-    rules::Rule,
+    cascades::CascadesOptimizer as OptdCascadesOptimizer, nodes::NodeType, rules::Rule,
 };
 use optd_og_datafusion_bridge::{DatafusionCatalog, OptdDfContext, OptdPlanContext};
 use optd_og_datafusion_repr::DatafusionOptimizer;
@@ -232,7 +232,7 @@ impl OptdOldBackend {
             None
         };
 
-        let df_ctx = optd_og_datafusion_bridge::create_df_context(
+        let df_ctx: OptdDfContext = optd_og_datafusion_bridge::create_df_context(
             Some(session_config.clone()),
             Some(rt_config.clone()),
             Some(Arc::new(mem_prov_list)),
@@ -251,6 +251,204 @@ impl OptdOldBackend {
             best_cascades: None,
             stats,
         })
+    }
+
+    // fn gather_all_costs_and_cards(
+    //     opt: &DatafusionOptimizer,
+    //     group_id: GroupId,
+    //     visited_exprs: &mut HashSet<ExprId>,
+    //     costs: &mut Vec<f64>,
+    //     cards: &mut Vec<f64>,
+    // ) {
+    //     let group = &opt.cascades_optimizer.memo.get_group(group_id);
+    //     let cost_model = opt.cascades_optimizer.cost();
+
+    //     for expr_id in &group.group_exprs {
+    //         if visited_exprs.contains(expr_id) {
+    //             continue;
+    //         }
+    //         visited_exprs.insert(*expr_id);
+
+    //         let expr = opt.cascades_optimizer.memo.get_expr_memoed(*expr_id);
+    //         if expr.typ.is_logical() {
+    //             continue; // skip logical expressions
+    //         }
+
+    //         // Recurse into children first
+    //         let mut input_stats = vec![];
+    //         for &child_gid in &expr.children {
+    //             Self::gather_all_costs_and_cards(opt, child_gid, visited_exprs, costs, cards);
+
+    //             let child_winner = opt
+    //                 .cascades_optimizer
+    //                 .memo
+    //                 .get_group_winner(child_gid)
+    //                 .as_full_winner();
+
+    //             let stat = child_winner.map(|x| x.statistics.clone());
+    //             input_stats.push(stat);
+    //         }
+
+    //         let input_stats_ref = input_stats
+    //             .iter()
+    //             .map(|x| x.as_ref().map(|s| s.as_ref()))
+    //             .collect::<Vec<_>>();
+
+    //         let context = RelNodeContext {
+    //             expr_id: *expr_id,
+    //             group_id,
+    //             children_group_ids: expr.children.clone(),
+    //         };
+
+    //         let op_cost = cost_model.compute_operation_cost(
+    //             &expr.typ,
+    //             &expr
+    //                 .predicates
+    //                 .iter()
+    //                 .map(|id| opt.cascades_optimizer.memo.get_pred(*id))
+    //                 .collect::<Vec<_>>(),
+    //             &input_stats_ref,
+    //             context,
+    //             &opt.cascades_optimizer,
+    //         );
+
+    //         // Record compute cost and cardinality
+    //         costs.push(op_cost.0[COMPUTE_COST]);
+    //         // let row_cnt = stat
+    //         //     .0
+    //         //     .downcast_ref::<DfStatistics>()
+    //         //     .map(|s| s.row_cnt)
+    //         //     .unwrap_or(0.0);
+
+    //         // TODO: placeholder
+    //         cards.push(100.0);
+    //     }
+    // }
+    fn compute_cost_and_cardinality_recursive(
+        optimizer: &DatafusionOptimizer,
+        group_id: GroupId,
+        expr_id: ExprId,
+        visited: &mut HashSet<ExprId>,
+        costs: &mut Vec<f64>,
+        cards: &mut Vec<f64>,
+        info_map: &mut HashMap<ExprId, (f64, f64, Vec<ExprId>)>, // expr_id -> (cost, card, children_expr_ids)
+    ) -> (Cost, Statistics) {
+        let cascade_optimizer = &optimizer.cascades_optimizer;
+
+        if visited.contains(&expr_id) {
+            return (
+                cascade_optimizer.cost().zero(),
+                Statistics(Box::new(DfStatistics { row_cnt: 0.0 })),
+            );
+        }
+
+        visited.insert(expr_id);
+
+        let memo = &cascade_optimizer.memo;
+        let expr = memo.get_expr_memoed(expr_id);
+        if expr.typ.is_logical() {
+            return (
+                cascade_optimizer.cost().zero(),
+                Statistics(Box::new(DfStatistics { row_cnt: 0.0 })),
+            );
+        }
+
+        let mut input_costs = vec![];
+        let mut input_stats = vec![];
+        let mut child_expr_ids = vec![];
+
+        for &child_group in &expr.children {
+            for child_expr_id in &memo.get_group(child_group).group_exprs {
+                let child_expr = memo.get_expr_memoed(*child_expr_id);
+                if child_expr.typ.is_logical() {
+                    continue;
+                }
+                let (child_cost, child_stat) = Self::compute_cost_and_cardinality_recursive(
+                    optimizer,
+                    child_group,
+                    *child_expr_id,
+                    visited,
+                    costs,
+                    cards,
+                    info_map,
+                );
+                input_costs.push(child_cost.clone());
+                input_stats.push(Some(Arc::new(child_stat)));
+                child_expr_ids.push(*child_expr_id);
+            }
+        }
+
+        let context = RelNodeContext {
+            expr_id,
+            group_id,
+            children_group_ids: expr.children.clone(),
+        };
+
+        let predicates = expr
+            .predicates
+            .iter()
+            .map(|id| memo.get_pred(*id))
+            .collect::<Vec<_>>();
+
+        let cost_model = cascade_optimizer.cost();
+
+        let input_stats_ref = input_stats
+            .iter()
+            .map(|x| x.as_ref().map(|y| y.as_ref()))
+            .collect_vec();
+
+        let op_cost = cost_model.compute_operation_cost(
+            &expr.typ,
+            &predicates,
+            &input_stats_ref,
+            context.clone(),
+            cascade_optimizer,
+        );
+
+        let total_cost = cost_model.sum(&op_cost, &input_costs);
+        let output_stats = cost_model.derive_statistics(
+            &expr.typ,
+            &predicates,
+            &input_stats_ref
+                .iter()
+                .map(|s| s.unwrap() as &Statistics)
+                .collect::<Vec<_>>(),
+            context,
+            cascade_optimizer,
+        );
+
+        // Store for analysis
+        costs.push(total_cost.0[COMPUTE_COST]);
+        if let Some(df) = output_stats.0.downcast_ref::<DfStatistics>() {
+            cards.push(df.row_cnt);
+        }
+
+        info_map.insert(
+            expr_id,
+            (
+                total_cost.0[COMPUTE_COST],
+                output_stats
+                    .0
+                    .downcast_ref::<DfStatistics>()
+                    .map_or(0.0, |s| s.row_cnt),
+                child_expr_ids,
+            ),
+        );
+
+        (total_cost, output_stats)
+    }
+
+    fn emit_preorder(
+        expr_id: ExprId,
+        info_map: &HashMap<ExprId, (f64, f64, Vec<ExprId>)>,
+        out: &mut Vec<(ExprId, f64, f64)>,
+    ) {
+        if let Some((cost, card, children)) = info_map.get(&expr_id) {
+            out.push((expr_id, *cost, *card));
+            for &child_expr_id in children {
+                Self::emit_preorder(child_expr_id, info_map, out);
+            }
+        }
     }
 
     #[async_recursion]
@@ -287,47 +485,64 @@ impl OptdOldBackend {
     fn get_alts_help(
         opt: &DatafusionOptimizer,
         gid: GroupId,
-        visited: &mut HashSet<ExprId>,
+        visited: &mut HashMap<GroupId, HashSet<ExprId>>,
         fake_meta: &mut PlanNodeMetaMap,
         physical_expr_count: &mut HashMap<GroupId, usize>,
+        node_group_map: &mut HashMap<usize, GroupId>,
     ) -> Vec<ArcDfPlanNode> {
         let mut out = Vec::new();
         let exprs = &opt.cascades_optimizer.memo.get_group(gid).group_exprs;
 
+        // one visited per GroupId, still one alternative
+        if !visited.contains_key(&gid) {
+            visited.insert(gid, HashSet::new());
+        }
+
         // println!("Group {gid} has {} expressions", exprs.len());
         let mut physical_cnt = 0;
         for expr_id in exprs {
-            if visited.contains(expr_id) {
+            let visited_gid = visited.get_mut(&gid).unwrap();
+            if visited_gid.contains(expr_id) {
                 continue;
             }
-            visited.insert(*expr_id);
+            visited_gid.insert(*expr_id);
             let expr = opt.cascades_optimizer.memo.get_expr_memoed(*expr_id);
-            if !matches!(
-                expr.typ,
-                DfNodeType::PhysicalAgg
-                    | DfNodeType::PhysicalEmptyRelation
-                    | DfNodeType::PhysicalProjection
-                    | DfNodeType::PhysicalScan
-                    | DfNodeType::PhysicalFilter
-                    | DfNodeType::PhysicalSort
-                    | DfNodeType::PhysicalNestedLoopJoin(_)
-                    | DfNodeType::PhysicalHashJoin(_)
-                    | DfNodeType::PhysicalLimit
-            ) {
+            // if !matches!(
+            //     expr.typ,
+            //     DfNodeType::PhysicalAgg
+            //         | DfNodeType::PhysicalEmptyRelation
+            //         | DfNodeType::PhysicalProjection
+            //         | DfNodeType::PhysicalScan
+            //         | DfNodeType::PhysicalFilter
+            //         | DfNodeType::PhysicalSort
+            //         | DfNodeType::PhysicalNestedLoopJoin(_)
+            //         | DfNodeType::PhysicalHashJoin(_)
+            //         | DfNodeType::PhysicalLimit
+            // ) {
+            //     continue;
+            // }
+            if expr.typ.is_logical() {
                 continue;
             }
+
             physical_cnt += 1;
             let mut children: Vec<Vec<ArcDfPlanNode>> = Vec::with_capacity(expr.children.len());
             for child in &expr.children {
                 // println!("Expr w/ id {expr_id} (aka {}) is has child in group {child}", expr.typ)
-                let child_alts =
-                    Self::get_alts_help(opt, *child, visited, fake_meta, physical_expr_count);
+                let child_alts = Self::get_alts_help(
+                    opt,
+                    *child,
+                    visited,
+                    fake_meta,
+                    physical_expr_count,
+                    node_group_map,
+                );
                 children.push(child_alts);
                 // println!("Child group {child} has {} alternatives", len);
             }
 
             if children.is_empty() {
-                out.push(Arc::new(optd_og_core::nodes::PlanNode {
+                let thing = Arc::new(optd_og_core::nodes::PlanNode {
                     typ: expr.typ.clone(),
                     children: vec![],
                     predicates: expr
@@ -335,7 +550,9 @@ impl OptdOldBackend {
                         .iter()
                         .map(|x| opt.cascades_optimizer.memo.get_pred(*x))
                         .collect(),
-                }));
+                });
+                node_group_map.insert(Arc::as_ptr(&thing) as usize, gid);
+                out.push(thing);
             } else {
                 let iter = children.iter().multi_cartesian_product();
                 for children in iter {
@@ -352,11 +569,16 @@ impl OptdOldBackend {
                             .map(|x| opt.cascades_optimizer.memo.get_pred(*x))
                             .collect(),
                     });
-                    // PUSH CHILDREN INTO META
-                    Self::insert_with_children(&thing, gid, fake_meta);
+
+                    node_group_map.insert(Arc::as_ptr(&thing) as usize, gid);
                     out.push(thing.clone());
                 }
             }
+        }
+
+        // PUSH CHILDREN INTO META
+        for node in &out {
+            Self::insert_with_children(node, fake_meta, &node_group_map);
         }
 
         physical_expr_count
@@ -370,13 +592,21 @@ impl OptdOldBackend {
 
     fn insert_with_children(
         node: &Arc<PlanNode<DfNodeType>>,
-        gid: GroupId,
         fake_meta: &mut PlanNodeMetaMap,
+        node_group_map: &HashMap<usize, GroupId>,
     ) {
+        let ptr = Arc::as_ptr(node) as usize;
+        let group_id = *node_group_map.get(&ptr).expect("group ID missing for node");
+
+        let key = node.as_ref() as *const _ as usize;
+        if fake_meta.contains_key(&key) {
+            return; // Already inserted
+        }
+
         fake_meta.insert(
-            node.as_ref() as *const _ as usize,
+            key,
             PlanNodeMeta {
-                group_id: gid,
+                group_id,
                 weighted_cost: 0.0,
                 cost: Cost(vec![]),
                 stat: Arc::new(optd_og_core::cost::Statistics(Box::new(DfStatistics {
@@ -389,33 +619,119 @@ impl OptdOldBackend {
 
         for child in &node.children {
             if let PlanNodeOrGroup::PlanNode(child_node) = child {
-                Self::insert_with_children(child_node, gid, fake_meta);
+                Self::insert_with_children(child_node, fake_meta, node_group_map);
             }
         }
     }
 
     async fn get_alts_memo(&mut self, st: &SessionState) -> Result<Vec<Plan>> {
-        let opt = self.opt.as_ref().unwrap();
-        let (gid, _, _) = self.best_cascades.take().unwrap();
-        let mut set = HashSet::new();
-        let mut fake_meta = HashMap::new();
-        let mut physical_expr_count = HashMap::new();
-        let plans =
-            Self::get_alts_help(opt, gid, &mut set, &mut fake_meta, &mut physical_expr_count);
+        let mut out = HashSet::new();
+        let retries = 1;
 
-        println!("Found {} alternates", plans.len());
-        let mut opt_ctx = OptdPlanContext::new(st);
-        opt_ctx.conv_into_optd_og(&self.plan.clone().unwrap())?;
-        opt_ctx.optimizer = Some(&opt);
-        let mut out = Vec::new();
-        for plan in plans {
-            // println!("{plan}");
-			// println!("waaa")
-            let phys_plan = opt_ctx.conv_from_optd_og(plan, fake_meta.clone()).await?;
-			let sz = crate::common::plan_size(phys_plan.clone());
-            out.push(Plan::new(phys_plan, vec![0.0; sz], vec![0.0; sz]))
+        // let opt = self.opt.as_ref().unwrap();
+
+        for _ in 0..retries {
+            // create a df context first
+            let opt = self.opt.as_mut().unwrap();
+
+            let mut opt_ctx = OptdPlanContext::new(st);
+
+            let plan = opt_ctx.conv_into_optd_og(&self.plan.clone().unwrap())?;
+            let plan = opt.heuristic_optimize(plan);
+
+            let best_cascades = opt.cascades_optimize(plan);
+
+            let (gid, _, _) = best_cascades.unwrap();
+            let mut set = HashMap::new();
+            let mut fake_meta = HashMap::new();
+            let mut physical_expr_count = HashMap::new();
+            let mut node_group_map = HashMap::new();
+            let plans = Self::get_alts_help(
+                opt,
+                gid,
+                &mut set,
+                &mut fake_meta,
+                &mut physical_expr_count,
+                &mut node_group_map,
+            );
+
+            for (group_id, counted) in &physical_expr_count {
+                let memo_physical_count = opt
+                    .cascades_optimizer
+                    .memo
+                    .get_group(*group_id)
+                    .group_exprs
+                    .iter()
+                    .filter(|eid| {
+                        let expr = opt.cascades_optimizer.memo.get_expr_memoed(**eid);
+                        !expr.typ.is_logical()
+                    })
+                    .count();
+
+                if *counted != memo_physical_count {
+                    println!(
+                        "Group {group_id} → memo has {memo_physical_count} physical exprs, \
+                but get_alts_help counted {counted}"
+                    );
+                }
+            }
+
+            let mut opt_ctx = OptdPlanContext::new(st);
+            opt_ctx.conv_into_optd_og(&self.plan.clone().unwrap())?;
+            opt_ctx.optimizer = Some(&opt);
+
+            for plan in plans {
+                println!("{plan}");
+                let mut costs = Vec::new();
+                let mut cards = Vec::new();
+                let mut visited = HashSet::new();
+                let mut info_map = HashMap::new();
+                // Self::get_costs_and_cards(gid, &opt, &mut costs, &mut cards).await;
+                let winner = opt
+                    .cascades_optimizer
+                    .memo
+                    .get_group_winner(gid)
+                    .as_full_winner()
+                    .unwrap();
+
+                Self::compute_cost_and_cardinality_recursive(
+                    &opt,
+                    gid,
+                    winner.expr_id,
+                    &mut visited,
+                    &mut costs,
+                    &mut cards,
+                    &mut info_map,
+                );
+
+                // println!("info_map: {:?}", info_map);
+
+                // let mut final_out = Vec::new();
+
+                // Self::emit_preorder(winner.expr_id, &info_map, &mut final_out);
+
+                // costs = final_out
+                //     .iter()
+                //     .map(|(_, cost, _)| *cost)
+                //     .collect::<Vec<_>>();
+
+                // cards = final_out
+                //     .iter()
+                //     .map(|(_, _, card)| *card)
+                //     .collect::<Vec<_>>();
+
+                println!("costs: {:?}", costs);
+                println!("cards: {:?}", cards);
+                let phys_plan = opt_ctx.conv_from_optd_og(plan, fake_meta.clone()).await?;
+                out.insert(Plan::new(phys_plan, costs, cards));
+            }
         }
-        Ok(out)
+
+        let ret = out.iter().cloned().collect_vec();
+
+        println!("Found {} alternate plans", ret.len());
+
+        Ok(ret)
     }
 
     /// Implements rule-based sampling for optd-old backend.
@@ -437,6 +753,7 @@ impl OptdOldBackend {
             Arc::new(rules::FilterInnerJoinTransposeRule::new()),
             Arc::new(rules::FilterSortTransposeRule::new()),
             Arc::new(rules::FilterAggTransposeRule::new()),
+            Arc::new(rules::HashJoinRule::new()),
             Arc::new(rules::ProjectionPullUpJoin::new()),
             Arc::new(rules::EliminateProjectRule::new()),
             Arc::new(rules::ProjectMergeRule::new()),
@@ -444,7 +761,6 @@ impl OptdOldBackend {
             Arc::new(rules::EliminateJoinRule::new()),
             Arc::new(rules::EliminateFilterRule::new()),
             Arc::new(rules::ProjectFilterTransposeRule::new()),
-            Arc::new(rules::HashJoinRule::new()),
         ];
 
         let needed: Vec<Arc<dyn Rule<DfNodeType, OptdCascadesOptimizer<DfNodeType>>>> = vec![
@@ -546,7 +862,11 @@ impl Sampler for OptdOldBackend {
         let mut opt_ctx = OptdPlanContext::new(st);
         let plan = opt_ctx.conv_into_optd_og(&pl)?;
         let plan = opt.heuristic_optimize(plan);
-        let out = opt.cascades_optimize(plan)?;
+        let out: (
+            GroupId,
+            Arc<PlanNode<DfNodeType>>,
+            HashMap<usize, PlanNodeMeta>,
+        ) = opt.cascades_optimize(plan)?;
         self.best_cascades = Some(out.clone());
         let (gid, plan, meta) = out;
         let mut cards = Vec::new();
@@ -560,7 +880,7 @@ impl Sampler for OptdOldBackend {
         let out = Plan::new(phys_plan, costs, cards);
         self.best = Some(out.clone());
 
-        // println!("best is\n{out}");
+        println!("best is\n{out}");
         Ok(out)
     }
 
@@ -635,8 +955,8 @@ pub struct SampleConfig;
 
 /// Output of sampler.
 pub struct SampleOutput {
-	pub name: String,
-	/// Plan chosen by the query optimizer.
+    pub name: String,
+    /// Plan chosen by the query optimizer.
     pub best_plan: Plan,
     /// Alternative plans not chosen by the query optimizer.
     pub alternates: Vec<Plan>,
@@ -648,7 +968,7 @@ pub struct SampleOutput {
 
 /// Input to sampler.
 pub struct QueryInfo {
-	pub name: String, 
+    pub name: String,
     /// Logical plan of query to optimize.
     pub plan: LogicalPlan,
     pub tables: Arc<dyn SchemaProvider>,
@@ -657,25 +977,25 @@ pub struct QueryInfo {
 }
 
 pub fn sample(
-	queries: impl Stream<Item = QueryInfo>,
-	_cfg: SampleConfig
+    queries: impl Stream<Item = QueryInfo>,
+    _cfg: SampleConfig,
 ) -> impl Stream<Item = SampleOutput> {
-	queries.then(|mut query| async move {
-		let backend = Arc::get_mut(&mut query.backend).unwrap();
-		let best = backend.get_best(&query.state, query.plan).await?;
-		let alts = backend.get_alternates(&query.state).await?;
-		// let alts = Vec::new();
-		
-		println!("Found {} alternatives", alts.len());
-		
-		Ok(SampleOutput {
-			name: query.name,
-			best_plan: best,
-			alternates: alts,
-			session: query.state,
-			tables: query.tables,
-		})
-	}).filter_map(|x: Result<SampleOutput>| async {
-		x.ok()
-	})
+    queries
+        .then(|mut query| async move {
+			let a = std::time::Instant::now();
+            let backend = Arc::get_mut(&mut query.backend).unwrap();
+            let best = backend.get_best(&query.state, query.plan).await?;
+            let alts = backend.get_alternates(&query.state).await?;
+            // let alts = Vec::new();
+            println!("Found {} alternatives", alts.len());
+
+            Ok(SampleOutput {
+                name: query.name,
+                best_plan: best,
+                alternates: alts,
+                session: query.state,
+                tables: query.tables,
+            })
+        })
+        .filter_map(|x: Result<SampleOutput>| async { x.ok() })
 }
