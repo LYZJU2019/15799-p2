@@ -4,27 +4,19 @@
 ## usage 
 First, run `git submodule update --init --recursive` if you didn't clone with the submodules already!
 
-To build and run the main CLI tool, run
-```sh
-cd optdbg
-cargo build --release # important!
-./target/debug/optdbg -o dolomite -q my_query.sql
-```
-
 # integration tests
-First, `cd integration-tests`.  Make sure you ran `cargo build --release` in the `optdbg` folder first! There's a hardcoded path to its target folder right now :(. 
+First, `cd integration-tests`.  Make sure you ran `cargo build --release` in the `optdbg` folder first! We rely on one of the binary targets in that crate.
 
-To initially set up data, Then, run
+To initially set up data, run
 ```sh
-cargo install tpchgen-cli
-mkdir tpch-data && cd tpch-data
-tpchgen-cli -f parquet -s [scale]
-cd -
+bash ./data.sh
 ```
-where `[scale]` is the scale factor you want to use for the data (pick 0.2 for something quick).
-
-Then, you can run the following:
+You can then do things like `cargo test` or 
 ```sh
-cargo run --release --bin test
+git 
+cd ../optdbg/optd-original
+git apply ../../integration-tests/join_underestimate.patch
+cd -
+cargo run --release --bin test -- --expect-err "HashJoinExec" --expect-kind "cardinality" --expect-by "under" 
 ```
 

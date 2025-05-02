@@ -562,20 +562,6 @@ async fn measure_plan(
 ) -> anyhow::Result<MeasuredPlan> {
 	let mut cardinalities = Vec::new();
 	let mut runtimes = Vec::new();
-	// FIXME temporary hack to get around OOMs. obviously not generic.
-	if plan.est_costs[0] > 25000000.0 {
-		let sz = plan.size();
-		return Ok(MeasuredPlan {
-			plan,
-			runtime: Err(MeasureError::Died),
-			cardinalities: vec![Err(MeasureError::Died); sz],
-			sub_runtimes: Some(vec![Err(MeasureError::Died); sz]),
-		});
-	}
-	
-	dump_plan(plan.tree.clone(), 0);
-	println!("{:?}", plan.est_costs);
-	let mut idx = 0;
 	measure_subplan(plan.tree.clone(), ctx, cfg, 
 					&mut cardinalities, &mut runtimes, tables).await?;
 	

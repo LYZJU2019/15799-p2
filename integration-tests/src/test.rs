@@ -83,6 +83,8 @@ async fn main() -> anyhow::Result<()> {
 			}
 		}
 	}
+	println!("Problems: {:?}", report.report_problems());
+	
 	if !qualified {
 		panic!("Test failed: got problems {:?}", report.report_problems());
 	}
