@@ -259,5 +259,223 @@ pub async fn analyze(
 		queries,
 	}
 }
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::{benchmark::{CardQuality, RuntimeStats}, common::Plan};
+	use datafusion::physical_plan::empty::EmptyExec;
+	use datafusion::arrow::datatypes::{Field, Schema};
+	use std::time::Duration;
+	use std::sync::Arc;
+
+	// Helper function to create a test plan
+	fn create_test_plan() -> Arc<dyn ExecutionPlan> {
+		let schema = Arc::new(Schema::new(Vec::<Field>::new()));
+		Arc::new(EmptyExec::new(schema))
+	}
+
+	// Helper function to create a test MeasuredPlan
+	fn create_measured_plan(runtime_ms: u64, est_cost: f64, est_card: f64, act_card: usize) -> MeasuredPlan {
+		let plan_tree = create_test_plan();
+		MeasuredPlan {
+			plan: Plan::new(plan_tree, vec![est_cost], vec![est_card]),
+			runtime: Ok(RuntimeStats::from_duration(Duration::from_millis(runtime_ms))),
+			cardinalities: vec![Ok(act_card)],
+			sub_runtimes: None,
+		}
+	}
+	
+	// Helper function to create a measured plan with issues
+	fn create_problematic_plan(error_type: MeasureError) -> MeasuredPlan {
+		let plan_tree = create_test_plan();
+		MeasuredPlan {
+			plan: Plan::new(plan_tree, vec![100.0], vec![1000.0]),
+			runtime: Err(error_type),
+			cardinalities: vec![Err(error_type)],
+			sub_runtimes: None,
+		}
+	}
+
+	#[test]
+	fn test_card_quality_from_q_err() {
+		// Test the CardQuality::from_q_err function with different q-error values
+		
+		// Excellent: q-error <= 2.0
+		assert_eq!(CardQuality::from_q_err(1.0), CardQuality::Excellent);
+		assert_eq!(CardQuality::from_q_err(1.5), CardQuality::Excellent);
+		assert_eq!(CardQuality::from_q_err(2.0), CardQuality::Excellent);
+		
+		// Good: 2.0 < q-error <= 4.0
+		assert_eq!(CardQuality::from_q_err(2.1), CardQuality::Good);
+		assert_eq!(CardQuality::from_q_err(3.0), CardQuality::Good);
+		assert_eq!(CardQuality::from_q_err(4.0), CardQuality::Good);
+		
+		// Acceptable: 4.0 < q-error <= 10.0
+		assert_eq!(CardQuality::from_q_err(4.1), CardQuality::Acceptable);
+		assert_eq!(CardQuality::from_q_err(7.5), CardQuality::Acceptable);
+		assert_eq!(CardQuality::from_q_err(10.0), CardQuality::Acceptable);
+		
+		// Poor: q-error > 10.0
+		assert_eq!(CardQuality::from_q_err(10.1), CardQuality::Poor);
+		assert_eq!(CardQuality::from_q_err(20.0), CardQuality::Poor);
+		assert_eq!(CardQuality::from_q_err(100.0), CardQuality::Poor);
+		
+		// Edge cases
+		assert_eq!(CardQuality::from_q_err(f64::INFINITY), CardQuality::Unknown);
+		assert_eq!(CardQuality::from_q_err(f64::NAN), CardQuality::Unknown);
+	}
+	
+	#[test]
+	fn test_node_problems() {
+		// Test creating and processing node problems
+		let mut problems: HashMap<usize, Vec<NodeProblem>> = HashMap::new();
+		
+		// Test CardinalityMisestimation problem
+		add_problem(&mut problems, &0, NodeProblem::CardinalityMisestimation(1000, 100, 10.0));
+		assert_eq!(problems.len(), 1);
+		
+		// Get a reference to verify
+		let node0_problems = problems.get(&0).unwrap();
+		assert_eq!(node0_problems.len(), 1);
+		
+		// Add another problem to the same node
+		add_problem(&mut problems, &0, NodeProblem::Crash);
+		assert_eq!(problems.len(), 1);
+		
+		// Get a reference to verify
+		let node0_problems = problems.get(&0).unwrap();
+		assert_eq!(node0_problems.len(), 2);
+		
+		// Add problem to a different node
+		add_problem(&mut problems, &1, NodeProblem::CostMisestimation(200, 10.0, 100, 500));
+		assert_eq!(problems.len(), 2);
+		
+		// Get references to verify
+		let node0_problems = problems.get(&0).unwrap();
+		let node1_problems = problems.get(&1).unwrap();
+		assert_eq!(node1_problems.len(), 1);
+		
+		// Verify problem details
+		match &node0_problems[0] {
+			NodeProblem::CardinalityMisestimation(est, act, q_err) => {
+				assert_eq!(*est, 1000);
+				assert_eq!(*act, 100);
+				assert_eq!(*q_err, 10.0);
+			},
+			_ => panic!("Wrong problem type"),
+		}
+		
+		match &node0_problems[1] {
+			NodeProblem::Crash => {},
+			_ => panic!("Wrong problem type"),
+		}
+		
+		match &node1_problems[0] {
+			NodeProblem::CostMisestimation(runtime_us, est_cost, est_card, act_card) => {
+				assert_eq!(*runtime_us, 200);
+				assert_eq!(*est_cost, 10.0);
+				assert_eq!(*est_card, 100);
+				assert_eq!(*act_card, 500);
+			},
+			_ => panic!("Wrong problem type"),
+		}
+	}
+	
+	#[test]
+	fn test_query_report() {
+		// Create measured plans
+		let plan1 = create_measured_plan(100, 5.0, 100.0, 90); // Good plan, slight underestimation
+		let plan2 = create_measured_plan(200, 15.0, 500.0, 50); // Worse plan, large overestimation
+		let plan3 = create_problematic_plan(MeasureError::Died); // Failed plan
+		
+		// Create node problems
+		let mut node_problems: HashMap<usize, HashMap<usize, Vec<NodeProblem>>> = HashMap::new();
+		let mut plan0_problems: HashMap<usize, Vec<NodeProblem>> = HashMap::new();
+		add_problem(&mut plan0_problems, &0, NodeProblem::CardinalityMisestimation(100, 90, 1.11));
+		node_problems.insert(0, plan0_problems);
+		
+		let mut plan1_problems: HashMap<usize, Vec<NodeProblem>> = HashMap::new();
+		add_problem(&mut plan1_problems, &0, NodeProblem::CardinalityMisestimation(500, 50, 10.0));
+		node_problems.insert(1, plan1_problems);
+		
+		let mut plan2_problems: HashMap<usize, Vec<NodeProblem>> = HashMap::new();
+		add_problem(&mut plan2_problems, &0, NodeProblem::Crash);
+		node_problems.insert(2, plan2_problems);
+		
+		// Create query report
+		let query_report = QueryReport {
+			optimal_chosen: true,
+			name: "test_query".to_string(),
+			metrics: OptimizerMetrics {
+				taqo_score_s: 0.2,
+				taqo_accuracy_percent: 80.0,
+				performance_factor: 1.0,
+				avg_q_error: 1.11,
+			},
+			samples: vec![plan1, plan2, plan3],
+			chosen: 0,
+			node_problems,
+		};
+		
+		// Check display formatting works
+		let report_str = format!("{}", query_report);
+		assert!(report_str.contains("test_query"));
+		assert!(report_str.contains("TAQO Score"));
+		assert!(report_str.contains("Cardinality estimation is excellent"));
+	}
+	
+	#[test]
+	fn test_report() {
+		// Create a basic report
+		let query1 = QueryReport {
+			optimal_chosen: true,
+			name: "query1".to_string(),
+			metrics: OptimizerMetrics {
+				taqo_score_s: 0.2,
+				taqo_accuracy_percent: 90.0,
+				performance_factor: 1.0,
+				avg_q_error: 1.5,
+			},
+			samples: vec![create_measured_plan(100, 5.0, 100.0, 90)],
+			chosen: 0,
+			node_problems: HashMap::new(),
+		};
+		
+		let query2 = QueryReport {
+			optimal_chosen: false,
+			name: "query2".to_string(),
+			metrics: OptimizerMetrics {
+				taqo_score_s: 0.5,
+				taqo_accuracy_percent: 70.0,
+				performance_factor: 0.5,
+				avg_q_error: 5.0,
+			},
+			samples: vec![
+				create_measured_plan(200, 10.0, 200.0, 50),
+				create_measured_plan(100, 5.0, 100.0, 90)
+			],
+			chosen: 0,
+			node_problems: HashMap::new(),
+		};
+		
+		let report = Report {
+			opt_freq: 0.5, // 1 out of 2 queries chose optimal plan
+			avg_taqo_score: 0.35, // (0.2 + 0.5) / 2
+			avg_taqo_acc: 80.0, // (90 + 70) / 2
+			avg_perf_factor: 0.75, // (1.0 + 0.5) / 2
+			queries: vec![query1, query2],
+		};
+		
+		// Check display formatting works
+		let report_str = format!("{}", report);
+		assert!(report_str.contains("GLOBAL STATS"));
+		assert!(report_str.contains("Optimality Frequency (OF): 50.00"));
+		assert!(report_str.contains("Average TAQO Score"));
+		assert!(report_str.contains("Average TAQO Accuracy"));
+		assert!(report_str.contains("query1"));
+		assert!(report_str.contains("query2"));
+	}
+}
 	
 	
