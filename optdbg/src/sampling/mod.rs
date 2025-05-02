@@ -237,7 +237,7 @@ impl OptdOldBackend {
             Some(rt_config.clone()),
             Some(Arc::new(mem_prov_list)),
             false,
-            false,
+            true,
             adv,
             stats.clone(),
         )
@@ -394,41 +394,29 @@ impl OptdOldBackend {
         }
     }
 
-    // async fn get_alts_memo(&mut self, st: &SessionState) -> Result<Vec<Plan>> {
-    //     let opt = self.opt.as_ref().unwrap();
-    //     let (gid, _, _) = self.best_cascades.take().unwrap();
-    //     let mut set = HashSet::new();
-    //     let mut fake_meta = HashMap::new();
-    //     let mut physical_expr_count = HashMap::new();
-    //     let plans =
-    //         Self::get_alts_help(opt, gid, &mut set, &mut fake_meta, &mut physical_expr_count);
+    async fn get_alts_memo(&mut self, st: &SessionState) -> Result<Vec<Plan>> {
+        let opt = self.opt.as_ref().unwrap();
+        let (gid, _, _) = self.best_cascades.take().unwrap();
+        let mut set = HashSet::new();
+        let mut fake_meta = HashMap::new();
+        let mut physical_expr_count = HashMap::new();
+        let plans =
+            Self::get_alts_help(opt, gid, &mut set, &mut fake_meta, &mut physical_expr_count);
 
-    //     // compare physical_expr_count with the number of physical expressions in the memo
-    //     for (group_id, count) in physical_expr_count {
-    //         let memo_count = opt
-    //             .cascades_optimizer
-    //             .memo
-    //             .get_group_physical_expr_count(group_id);
-
-    //         if count != memo_count {
-    //             println!(
-    //                 "Group {group_id} has {count} physical expressions in the plan, but {memo_count} in the memo"
-    //             );
-    //         }
-    //     }
-
-    //     println!("Found {} alternates", plans.len());
-    //     let mut opt_ctx = OptdPlanContext::new(st);
-    //     opt_ctx.conv_into_optd_og(&self.plan.clone().unwrap())?;
-    //     opt_ctx.optimizer = Some(&opt);
-    //     let mut out = Vec::new();
-    //     for plan in plans {
-    //         println!("{plan}");
-    //         let phys_plan = opt_ctx.conv_from_optd_og(plan, fake_meta.clone()).await?;
-    //         out.push(Plan::new(phys_plan, vec![], vec![]))
-    //     }
-    //     Ok(out)
-    // }
+        println!("Found {} alternates", plans.len());
+        let mut opt_ctx = OptdPlanContext::new(st);
+        opt_ctx.conv_into_optd_og(&self.plan.clone().unwrap())?;
+        opt_ctx.optimizer = Some(&opt);
+        let mut out = Vec::new();
+        for plan in plans {
+            // println!("{plan}");
+			// println!("waaa")
+            let phys_plan = opt_ctx.conv_from_optd_og(plan, fake_meta.clone()).await?;
+			let sz = crate::common::plan_size(phys_plan.clone());
+            out.push(Plan::new(phys_plan, vec![0.0; sz], vec![0.0; sz]))
+        }
+        Ok(out)
+    }
 
     /// Implements rule-based sampling for optd-old backend.
     // TODO Be a lot smarter about this: can pre-filter rules for applicability,
@@ -449,7 +437,6 @@ impl OptdOldBackend {
             Arc::new(rules::FilterInnerJoinTransposeRule::new()),
             Arc::new(rules::FilterSortTransposeRule::new()),
             Arc::new(rules::FilterAggTransposeRule::new()),
-            Arc::new(rules::HashJoinRule::new()),
             Arc::new(rules::ProjectionPullUpJoin::new()),
             Arc::new(rules::EliminateProjectRule::new()),
             Arc::new(rules::ProjectMergeRule::new()),
@@ -457,6 +444,7 @@ impl OptdOldBackend {
             Arc::new(rules::EliminateJoinRule::new()),
             Arc::new(rules::EliminateFilterRule::new()),
             Arc::new(rules::ProjectFilterTransposeRule::new()),
+            Arc::new(rules::HashJoinRule::new()),
         ];
 
         let needed: Vec<Arc<dyn Rule<DfNodeType, OptdCascadesOptimizer<DfNodeType>>>> = vec![
@@ -572,14 +560,14 @@ impl Sampler for OptdOldBackend {
         let out = Plan::new(phys_plan, costs, cards);
         self.best = Some(out.clone());
 
-        println!("best is\n{out}");
+        // println!("best is\n{out}");
         Ok(out)
     }
 
     async fn get_alternates(&mut self, st: &SessionState) -> Result<Vec<Plan>> {
         match &self.strat {
             SampleStrategy::RuleBased(t) => self.get_alts_rule(st, *t).await,
-            // SampleStrategy::MemoBased => self.get_alts_memo(st).await,
+            SampleStrategy::MemoBased => self.get_alts_memo(st).await,
             _ => unreachable!(),
         }
     }
@@ -679,7 +667,7 @@ pub fn sample(
 		// let alts = Vec::new();
 		
 		println!("Found {} alternatives", alts.len());
-
+		
 		Ok(SampleOutput {
 			name: query.name,
 			best_plan: best,

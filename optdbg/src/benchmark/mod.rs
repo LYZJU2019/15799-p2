@@ -403,15 +403,10 @@ async fn measure_subplan(
 	node: Arc<dyn ExecutionPlan>,
 	ctx: Arc<TaskContext>,
 	cfg: &BenchmarkConfig,
-	est_costs: &Vec<f64>,
-	idx: &mut usize,
 	cards: &mut Vec<Result<usize, MeasureError>>,
 	times: &mut Vec<Result<RuntimeStats, MeasureError>>,
 	tables: Arc<dyn SchemaProvider>,
 ) -> anyhow::Result<()> {
-	// FIXME temporary hack
-	println!("est cost is {}", est_costs[*idx]);
-	
 	println!("Timing subplan");
 	crate::common::dump_plan(node.clone(), 0);	
 	match time_subplan_ipc(node.clone(), cfg, tables.clone()).await? {
@@ -445,7 +440,6 @@ async fn measure_subplan(
 				for _ in 0..children_count {
 					cards.push(Err(e));
 					times.push(Err(e));
-					*idx += 1; // Increment idx for each skipped child
 				}
 				
 				return Ok(());
@@ -454,9 +448,8 @@ async fn measure_subplan(
 	}
 
 	for child in node.children() {
-		*idx += 1;
-		measure_subplan(child.clone(), ctx.clone(), cfg, &est_costs,
-						idx, cards, times, tables.clone()).await?;
+		measure_subplan(child.clone(), ctx.clone(), cfg,
+						cards, times, tables.clone()).await?;
 	}
 	Ok(())
 }
@@ -471,14 +464,25 @@ async fn measure_plan(
 	let mut cardinalities = Vec::new();
 	let mut runtimes = Vec::new();
 	// FIXME temporary hack to get around OOMs. obviously not generic.
+	if plan.est_costs[0] > 25000000.0 {
+		let sz = plan.size();
+		return Ok(MeasuredPlan {
+			plan,
+			runtime: Err(MeasureError::Died),
+			cardinalities: vec![Err(MeasureError::Died); sz],
+			sub_runtimes: Some(vec![Err(MeasureError::Died); sz]),
+		});
+	}
+	
 	dump_plan(plan.tree.clone(), 0);
 	println!("{:?}", plan.est_costs);
 	let mut idx = 0;
-	measure_subplan(plan.tree.clone(), ctx, cfg, &plan.est_costs, &mut idx,
+	measure_subplan(plan.tree.clone(), ctx, cfg, 
 					&mut cardinalities, &mut runtimes, tables).await?;
 	
 	if let Ok(runtime_stats) = &runtimes[0] {
-		println!("ran plan in {}ms mean (stddev: {}ms, min: {}ms, max: {}ms, CV: {:.2}%) (est cost {})", 
+		println!("ran plan in {}ms mean (stddev: {}ms, min: {}ms, max: {}ms,
+ CV: {:.2}%) (est cost {})", 
 		         runtime_stats.mean.as_millis(), 
 		         runtime_stats.stddev.as_millis(),
 		         runtime_stats.min.as_millis(),
@@ -646,7 +650,9 @@ async fn run_plan_ipc(
 			}
 		}
 	} else {
-		child.wait()
+		let output = child.wait_with_output().unwrap();
+		println!("{}", String::from_utf8_lossy(&output.stdout));
+		Ok(output.status)
 	};
 
 	match status {

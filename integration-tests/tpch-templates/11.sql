@@ -6,7 +6,7 @@
 :o
 select
 	ps_partkey,
-	sum(ps_supplycost * ps_availqty) as value
+	sum(ps_supplycost * cast(ps_availqty as double)) as value
 from
 	partsupp,
 	supplier,
@@ -17,9 +17,9 @@ where
 	and n_name = ':1'
 group by
 	ps_partkey having
-		sum(ps_supplycost * ps_availqty) > (
+		sum(ps_supplycost * cast(ps_availqty as double)) > (
 			select
-				sum(ps_supplycost * ps_availqty) * :2
+				sum(ps_supplycost * cast(ps_availqty as double)) * :2
 			from
 				partsupp,
 				supplier,

@@ -4,7 +4,10 @@ use datafusion::{common::HashMap, physical_plan::ExecutionPlan};
 use futures::{Stream, StreamExt};
 use itertools::Itertools;
 
-use crate::{benchmark::{calculate_q_error, BenchmarkOutput, CardQuality, MeasuredPlan, OptimizerMetrics}, common::{partial_eq_plans, MeasureError}};
+use crate::{
+	benchmark::{calculate_q_error, BenchmarkOutput, CardQuality, MeasuredPlan, OptimizerMetrics},
+	common::{partial_eq_plans, MeasureError}
+};
 
 // Placeholder type.
 pub struct AnalysisConfig;	
