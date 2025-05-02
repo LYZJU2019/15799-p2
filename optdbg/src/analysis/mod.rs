@@ -38,6 +38,10 @@ pub struct Report {
 	pub avg_taqo_acc: f64,
 	pub avg_perf_factor: f64,
 	pub queries: Vec<QueryReport>,
+	/// Global node problem frequency across all queries
+	pub global_node_problems: HashMap<String, (HashMap<String, (usize, usize)>, usize)>,
+	/// Global predicate problem frequency across all queries
+	pub global_pred_problems: HashMap<String, (HashMap<String, (usize, usize)>, usize)>,
 }
 
 pub struct QueryReport {
@@ -95,6 +99,16 @@ impl QueryReport {
 			idx,
 			&mut node_idx
 		)
+	}
+
+	// Add a method to get node problem frequency
+	pub fn node_problems(&self) -> &HashMap<String, (HashMap<String, (usize, usize)>, usize)> {
+		&self.node_problem_frequency
+	}
+	
+	// Add a method to get predicate problem frequency
+	pub fn pred_problems(&self) -> &HashMap<String, (HashMap<String, (usize, usize)>, usize)> {
+		&self.pred_problem_frequency
 	}
 }
 
@@ -342,6 +356,31 @@ fn collect_freq_info(
 		.is_some();
 }
 
+// Helper function to combine problem frequency maps
+fn combine_problem_maps(
+    maps: Vec<&HashMap<String, (HashMap<String, (usize, usize)>, usize)>>
+) -> HashMap<String, (HashMap<String, (usize, usize)>, usize)> {
+    let mut result = HashMap::new();
+    
+    for map in maps {
+        for (node_type, (problems, count)) in map {
+            let entry = result.entry(node_type.clone()).or_insert_with(|| (HashMap::new(), 0));
+            
+            // Add the count
+            entry.1 += count;
+            
+            // Combine problem counts
+            for (problem_type, (too_low, too_high)) in problems {
+                let problem_entry = entry.0.entry(problem_type.clone()).or_insert((0, 0));
+                problem_entry.0 += too_low;
+                problem_entry.1 += too_high;
+            }
+        }
+    }
+    
+    result
+}
+
 pub async fn analyze(
 	benches: impl Stream<Item = BenchmarkOutput>,
 	cfg: AnalysisConfig
@@ -418,6 +457,13 @@ pub async fn analyze(
 		}
 	}).collect().await;
 
+	let global_node_problems = combine_problem_maps(
+		queries.iter().map(|q| q.node_problems()).collect()
+	);
+	let global_pred_problems = combine_problem_maps(
+		queries.iter().map(|q| q.pred_problems()).collect()
+	);
+
 	Report {
 		opt_freq: queries
 			.iter()
@@ -436,6 +482,8 @@ pub async fn analyze(
 			.map(|q| q.metrics.performance_factor)
 			.sum::<f64>() / queries.len() as f64,
 		queries,
+		global_node_problems,
+		global_pred_problems,
 	}
 }
 
@@ -650,6 +698,8 @@ mod tests {
 			avg_taqo_acc: 80.0, // (90 + 70) / 2
 			avg_perf_factor: 0.75, // (1.0 + 0.5) / 2
 			queries: vec![query1, query2],
+			global_node_problems: HashMap::new(),
+			global_pred_problems: HashMap::new(),
 		};
 		
 		// Check display formatting works
@@ -660,6 +710,93 @@ mod tests {
 		assert!(report_str.contains("Average TAQO Accuracy"));
 		assert!(report_str.contains("query1"));
 		assert!(report_str.contains("query2"));
+	}
+
+	// Create fake report for testing
+	fn create_test_report() -> Report {
+		// Create some test plans with fake data
+		let schema = Arc::new(Schema::new(vec![]));
+		let empty_exec = EmptyExec::new(schema);
+		let plan_tree = Arc::new(empty_exec);
+		
+		let plan1 = Plan::new(plan_tree.clone(), vec![1.0], vec![100.0]);
+		let plan2 = Plan::new(plan_tree.clone(), vec![2.0], vec![200.0]);
+		
+		// Create node problem maps
+		let mut node_freq1 = HashMap::new();
+		let mut problem_map1 = HashMap::new();
+		problem_map1.insert("cardinality_misestimation".to_string(), (5, 2));
+		node_freq1.insert("ProjectionExec".to_string(), (problem_map1, 10));
+		
+		let mut node_freq2 = HashMap::new();
+		let mut problem_map2 = HashMap::new();
+		problem_map2.insert("cost_misestimation".to_string(), (3, 1));
+		node_freq2.insert("HashJoinExec".to_string(), (problem_map2, 5));
+		
+		// Create measured plans
+		let measured_plan1 = MeasuredPlan {
+			plan: plan1,
+			runtime: Ok(RuntimeStats::from_duration(std::time::Duration::from_millis(100))),
+			cardinalities: vec![Ok(100)],
+			sub_runtimes: Some(vec![Ok(RuntimeStats::from_duration(std::time::Duration::from_millis(100)))]),
+		};
+		
+		let measured_plan2 = MeasuredPlan {
+			plan: plan2,
+			runtime: Ok(RuntimeStats::from_duration(std::time::Duration::from_millis(200))),
+			cardinalities: vec![Ok(200)],
+			sub_runtimes: Some(vec![Ok(RuntimeStats::from_duration(std::time::Duration::from_millis(200)))]),
+		};
+		
+		// Create query reports
+		let query1 = QueryReport {
+			node_problem_frequency: node_freq1.clone(),
+			pred_problem_frequency: HashMap::new(),
+			optimal_chosen: true,
+			name: "query1".to_string(),
+			metrics: OptimizerMetrics {
+				taqo_score_s: 0.1,
+				taqo_accuracy_percent: 90.0,
+				performance_factor: 1.0,
+				avg_q_error: 1.0,
+			},
+			samples: vec![measured_plan1],
+			chosen: 0,
+			node_problems: HashMap::new(),
+		};
+		
+		let query2 = QueryReport {
+			node_problem_frequency: node_freq2.clone(),
+			pred_problem_frequency: HashMap::new(),
+			optimal_chosen: false,
+			name: "query2".to_string(),
+			metrics: OptimizerMetrics {
+				taqo_score_s: 0.3,
+				taqo_accuracy_percent: 70.0,
+				performance_factor: 0.5,
+				avg_q_error: 2.0,
+			},
+			samples: vec![measured_plan2],
+			chosen: 0,
+			node_problems: HashMap::new(),
+		};
+		
+		// Create and combine the global maps directly from the query reports
+		let mut maps = Vec::new();
+		maps.push(&node_freq1);
+		maps.push(&node_freq2);
+		let global_node_problems = combine_problem_maps(maps);
+		
+		// Create report
+		Report {
+			opt_freq: 0.5, // 1 out of 2 queries chose the optimal plan
+			avg_taqo_score: 0.2, // (0.1 + 0.3) / 2
+			avg_taqo_acc: 80.0, // (90.0 + 70.0) / 2
+			avg_perf_factor: 0.75, // (1.0 + 0.5) / 2
+			queries: vec![query1, query2],
+			global_node_problems,
+			global_pred_problems: HashMap::new(),
+		}
 	}
 }
 	

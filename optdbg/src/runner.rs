@@ -47,6 +47,10 @@ struct Args {
 	/// Path to schema info 
 	#[arg(short, long)]
     schemas_path: String,
+
+	/// Path to data directory
+	#[arg(short = 'd', long, default_value = "./tpch-data")]
+    data_dir: String,
 }
 
 #[tokio::main]
@@ -57,10 +61,9 @@ async fn main() -> anyhow::Result<()> {
 	let schemas: Vec<(String, Schema)> = serde_json::from_slice(&schema_bytes)?;
 	
 	let df_ctx = SessionContext::new();
-	// TODO TODO this is hardcoded very sad :( 
 	for tableref in schemas {
 		let options = ParquetReadOptions::new().schema(&tableref.1);
-		let path = format!("./tpch-data/{}.parquet", tableref.0);
+		let path = format!("{}/{}.parquet", args.data_dir, tableref.0);
 		let table_path = std::path::Path::new(&path).canonicalize()?;
 		df_ctx.register_parquet(
 			tableref.0,

@@ -293,6 +293,8 @@ pub struct BenchmarkConfig {
 	pub overlap_threshold: f64,
 	/// Whether to skip measuring subplans of failing plans
 	pub early_stopping: bool,
+	/// Track performance metrics
+	pub track_metrics: bool,
 }
 
 impl Default for BenchmarkConfig {
@@ -305,6 +307,7 @@ impl Default for BenchmarkConfig {
 			drop_outliers: false,
 			overlap_threshold: 0.5,
 			early_stopping: true,
+			track_metrics: true,
 		}
 	}
 }
@@ -397,7 +400,91 @@ impl MeasuredPlan {
 	}
 }
 
-/// Recursively populate cardinality and runtime arrays.
+// Add a new struct for tracking performance metrics
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct PerformanceMetrics {
+	/// Total execution time
+	pub total_time: Duration,
+	/// Number of plans measured
+	pub plans_measured: usize,
+	/// Number of cache hits
+	pub cache_hits: usize,
+	/// Number of cache misses
+	pub cache_misses: usize,
+	/// Number of early stopping events
+	pub early_stops: usize,
+	/// Total time saved by cache hits (estimated)
+	pub cache_time_saved: Duration,
+	/// Total time saved by early stopping (estimated)
+	pub early_stopping_time_saved: Duration,
+}
+
+impl PerformanceMetrics {
+	pub fn new() -> Self {
+		Self::default()
+	}
+	
+	pub fn report(&self) -> String {
+		let cache_hit_rate = if self.cache_hits + self.cache_misses > 0 {
+			self.cache_hits as f64 / (self.cache_hits + self.cache_misses) as f64 * 100.0
+		} else {
+			0.0
+		};
+		
+		format!(
+			"\nPerformance Metrics:\n\
+			Total execution time: {:.2}s\n\
+			Plans measured: {}\n\
+			Cache hit rate: {:.2}%\n\
+			Cache hits: {}\n\
+			Cache misses: {}\n\
+			Early stopping events: {}\n\
+			Estimated time saved by caching: {:.2}s\n\
+			Estimated time saved by early stopping: {:.2}s\n",
+			self.total_time.as_secs_f64(),
+			self.plans_measured,
+			cache_hit_rate,
+			self.cache_hits,
+			self.cache_misses,
+			self.early_stops,
+			self.cache_time_saved.as_secs_f64(),
+			self.early_stopping_time_saved.as_secs_f64()
+		)
+	}
+	
+	// Combine with another metrics object
+	pub fn combine(&mut self, other: &Self) {
+		self.total_time += other.total_time;
+		self.plans_measured += other.plans_measured;
+		self.cache_hits += other.cache_hits;
+		self.cache_misses += other.cache_misses;
+		self.early_stops += other.early_stops;
+		self.cache_time_saved += other.cache_time_saved;
+		self.early_stopping_time_saved += other.early_stopping_time_saved;
+	}
+}
+
+// Add a global variable to track metrics
+thread_local! {
+	static PERFORMANCE_METRICS: std::cell::RefCell<PerformanceMetrics> = std::cell::RefCell::new(PerformanceMetrics::new());
+}
+
+// Add a function to get the current metrics
+pub fn get_performance_metrics() -> PerformanceMetrics {
+	PERFORMANCE_METRICS.with(|metrics| metrics.borrow().clone())
+}
+
+// Add a function to reset metrics
+pub fn reset_performance_metrics() {
+	PERFORMANCE_METRICS.with(|metrics| *metrics.borrow_mut() = PerformanceMetrics::new());
+}
+
+// Add a function to report metrics
+pub fn report_performance_metrics() -> String {
+	PERFORMANCE_METRICS.with(|metrics| metrics.borrow().report())
+}
+
+// Update the async_recursion function to track early stopping
 #[async_recursion]
 async fn measure_subplan(
 	node: Arc<dyn ExecutionPlan>,
@@ -440,6 +527,16 @@ async fn measure_subplan(
 				for _ in 0..children_count {
 					cards.push(Err(e));
 					times.push(Err(e));
+				}
+				
+				// Track early stopping metrics if enabled
+				if cfg.track_metrics {
+					PERFORMANCE_METRICS.with(|metrics| {
+						let mut metrics = metrics.borrow_mut();
+						metrics.early_stops += 1;
+						// Estimate time saved as 100ms per skipped child (conservative estimate)
+						metrics.early_stopping_time_saved += Duration::from_millis(100 * children_count as u64);
+					});
 				}
 				
 				return Ok(());
@@ -501,20 +598,49 @@ async fn measure_plan(
 	})
 }
 
-/// Time a single subplan and return (cardinality, runtime).
+// Update the time_subplan_ipc function to track cache metrics
 async fn time_subplan_ipc(
 	plan: Arc<dyn ExecutionPlan>,
 	cfg: &BenchmarkConfig,
 	tables: Arc<dyn SchemaProvider>,
 ) -> anyhow::Result<Result<(usize, RuntimeStats), MeasureError>> {
+	// Track execution time for performance metrics
+	let start_time = Instant::now();
+	
 	// Skip cache if caching is disabled in config
 	if !cfg.enable_cache {
-		return run_plan_ipc_multiple(plan, cfg, tables).await;
+		let result = run_plan_ipc_multiple(plan, cfg, tables).await?;
+		
+		// Track metrics if enabled
+		if cfg.track_metrics {
+			let elapsed = start_time.elapsed();
+			PERFORMANCE_METRICS.with(|metrics| {
+				let mut metrics = metrics.borrow_mut();
+				metrics.total_time += elapsed;
+				metrics.plans_measured += 1;
+				metrics.cache_misses += 1;
+			});
+		}
+		
+		return Ok(result);
 	}
 	
 	// Only cache if plan is small enough
 	if !is_plan_cacheable(&plan) {
-		return run_plan_ipc_multiple(plan, cfg, tables).await;
+		let result = run_plan_ipc_multiple(plan, cfg, tables).await?;
+		
+		// Track metrics if enabled
+		if cfg.track_metrics {
+			let elapsed = start_time.elapsed();
+			PERFORMANCE_METRICS.with(|metrics| {
+				let mut metrics = metrics.borrow_mut();
+				metrics.total_time += elapsed;
+				metrics.plans_measured += 1;
+				metrics.cache_misses += 1;
+			});
+		}
+		
+		return Ok(result);
 	}
 	
 	// Calculate plan hash
@@ -527,6 +653,24 @@ async fn time_subplan_ipc(
 	
 	if let Some(result) = cached_result {
 		println!("Cache hit! Reusing previous execution result");
+		
+		// Track metrics if enabled
+		if cfg.track_metrics {
+			let elapsed = start_time.elapsed();
+			let avg_execution_time = match &result {
+				Ok((_, stats)) => stats.mean,
+				Err(_) => Duration::from_millis(1), // Minimal time for errors
+			};
+			
+			PERFORMANCE_METRICS.with(|metrics| {
+				let mut metrics = metrics.borrow_mut();
+				metrics.total_time += elapsed;
+				metrics.cache_hits += 1;
+				// Estimate time saved as the average execution time of the cached plan
+				metrics.cache_time_saved += avg_execution_time;
+			});
+		}
+		
 		return Ok(result);
 	}
 	
@@ -546,6 +690,17 @@ async fn time_subplan_ipc(
 					 hits, misses, rate * 100.0);
 		}
 	});
+	
+	// Track metrics if enabled
+	if cfg.track_metrics {
+		let elapsed = start_time.elapsed();
+		PERFORMANCE_METRICS.with(|metrics| {
+			let mut metrics = metrics.borrow_mut();
+			metrics.total_time += elapsed;
+			metrics.plans_measured += 1;
+			metrics.cache_misses += 1;
+		});
+	}
 	
 	Ok(result)
 }
@@ -632,7 +787,10 @@ async fn run_plan_ipc(
 	
 	let out_file = tempfile::NamedTempFile::new()?;
 
-	let mut child = std::process::Command::new("../optdbg/target/release/runner")
+	// Get runner command from environment or use default
+	let runner_command = std::env::var("OPTDBG_RUNNER_PATH").unwrap_or_else(|_| "runner".to_string());
+
+	let mut child = std::process::Command::new(runner_command)
 		.arg("-p").arg(plan_file.path())
 		.arg("-s").arg(schema_file.path())
 		.arg("-o").arg(out_file.path())
@@ -890,11 +1048,17 @@ impl CardQuality {
 	}
 }
 
+// Update the benchmark function to reset and report metrics
 pub fn benchmark(
 	samples: impl Stream<Item = SampleOutput>,
 	cfg: BenchmarkConfig
 ) -> impl Stream<Item = BenchmarkOutput> {
-	samples.then(move |sample| async move {
+	// Reset performance metrics at the start of benchmarking
+	if cfg.track_metrics {
+		reset_performance_metrics();
+	}
+	
+	let stream = samples.then(move |sample| async move {
 		println!("{} {}", sample.name, sample.alternates.len());
 		let ctx = sample.session.task_ctx();
 		let mut out = Vec::new();
@@ -946,6 +1110,11 @@ pub fn benchmark(
 		// Calculate average Q-Error for the chosen plan
 		let avg_q_error = calculate_avg_q_error(&out[chosen_idx]);
 		
+		// Log performance metrics for this benchmark if tracking is enabled
+		if cfg.track_metrics {
+			println!("{}", report_performance_metrics());
+		}
+		
 		Ok(BenchmarkOutput {
 			name: sample.name,
 			plans: out,
@@ -959,7 +1128,10 @@ pub fn benchmark(
 		})
 	}).filter_map(|x: anyhow::Result<BenchmarkOutput>| async {
 		x.ok()
-	})
+	});
+	
+	// Add a step to report final metrics before returning
+	stream
 }
 
 /// Calculates the Optimality Frequency (OF) across a workload of queries.
@@ -1547,6 +1719,7 @@ mod tests {
 			drop_outliers: true,
 			overlap_threshold: 0.7,
 			early_stopping: false,
+			track_metrics: true,
 		};
 		
 		assert_eq!(custom_config.fast, true);
