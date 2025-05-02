@@ -1,6 +1,6 @@
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
-use datafusion::{common::HashMap, physical_plan::ExecutionPlan};
+use datafusion::{common::HashMap, physical_expr::expressions::BinaryExpr, physical_plan::{filter::FilterExec, joins::{HashJoinExec, NestedLoopJoinExec}, ExecutionPlan, PhysicalExpr}};
 use futures::{Stream, StreamExt};
 use itertools::Itertools;
 
@@ -9,8 +9,10 @@ use crate::{
 	common::{partial_eq_plans, MeasureError}
 };
 
-// Placeholder type.
-pub struct AnalysisConfig;	
+pub struct AnalysisConfig {
+	/// Whether to only consider "root" problems (those with good inputs) for bug detection.
+	pub root_problems_only: bool,
+}	
 
 #[derive(Debug)]
 pub enum NodeProblem {
@@ -29,6 +31,8 @@ pub struct Report {
 }
 
 pub struct QueryReport {
+	node_problem_frequency: HashMap<String, (usize, usize)>,
+	pred_problem_frequency: HashMap<String, (usize, usize)>,
 	pub optimal_chosen: bool,
 	pub name: String,
 	pub metrics: OptimizerMetrics,
@@ -130,6 +134,8 @@ impl std::fmt::Display for QueryReport {
 			CardQuality::Unknown => 
 				writeln!(f, "Cardinality estimation cannot be evaluated"),
 		}?;
+		writeln!(f, "Node problems:\n {:?}", self.node_problem_frequency)?;
+		writeln!(f, "Pred problems:\n {:?}", self.pred_problem_frequency)?;
 		writeln!(f, "\n--------------------------------------------------\n")?;
 		
 		for i in 0..self.samples.len() {
@@ -177,9 +183,114 @@ fn proc_plan(
 	}
 }
 
+fn get_pred_true_name(node: Arc<dyn PhysicalExpr>) -> String {
+	let debug_repr = format!("{:?}", node);
+	let name = debug_repr.split(' ').next().unwrap();
+	match name {
+		"BinaryExpr" => {
+			let expr: &BinaryExpr = node.as_any().downcast_ref().unwrap();
+			expr.op().to_string()
+		},
+		o => o.to_string(),
+	}
+}
+
+fn get_pred_nodes_expr(node: Arc<dyn PhysicalExpr>, out: &mut Vec<String>) {
+	out.push(get_pred_true_name(node.clone()));
+	for c in node.children() {
+		get_pred_nodes_expr(c.clone(), out);
+	}
+}
+
+fn get_pred_nodes(node: Arc<dyn ExecutionPlan>) -> HashSet<String> {
+	let mut expr_nodes = Vec::new();
+	match node.name() {
+		"FilterExec" => {
+			let filter: &FilterExec = node.as_any().downcast_ref().unwrap();
+			let pred = filter.predicate();
+			println!("Filter with predicate {:?}", pred);
+			get_pred_nodes_expr(pred.clone(), &mut expr_nodes);
+			println!("Got nodes {:?}", expr_nodes);
+		},
+		"HashJoinExec" => {
+			let join: &HashJoinExec = node.as_any().downcast_ref().unwrap();
+			for (l, r) in &join.on {
+				get_pred_nodes_expr(l.clone(), &mut expr_nodes);
+				get_pred_nodes_expr(r.clone(), &mut expr_nodes);
+			}
+			if let Some(e) = &join.filter {
+				get_pred_nodes_expr(e.expression().clone(), &mut expr_nodes);
+			}
+		},
+		"NestedLoopJoinExec" => {
+			let join: &NestedLoopJoinExec = node.as_any().downcast_ref().unwrap();
+			if let Some(e) = &join.filter() {
+				get_pred_nodes_expr(e.expression().clone(), &mut expr_nodes);
+			}
+		},
+		_ => (),
+	}
+	expr_nodes.into_iter().collect()
+}
+
+fn collect_freq_info(
+	plan_idx: usize,
+	node_idx: &mut usize,
+	node: Arc<dyn ExecutionPlan>,
+	problems: &HashMap<usize, HashMap<usize, Vec<NodeProblem>>>,
+	node_freqs: &mut HashMap<String, (usize, usize)>,
+	pred_freqs: &mut HashMap<String, (usize, usize)>,
+	root_only: bool,
+) -> bool {
+	// Do not process crashed nodes! 
+	let just_crash = problems.get(&plan_idx)
+		.and_then(|x| x.get(node_idx))
+		.map(|x| x.len() == 1 && matches!(x[0], NodeProblem::Crash));
+	if let Some(true) = just_crash {
+		// There may be live nodes below this depending on if early stopping was enabled.
+		// Code duplication here is annoying but not worth a refactor.
+		for c in node.children() {
+			*node_idx += 1;
+			collect_freq_info(plan_idx, node_idx, c.clone(),
+							  problems, node_freqs, pred_freqs, root_only);
+		}
+		return false;
+	}	
+	
+	let mut has_problem = problems.get(&plan_idx)
+		.and_then(|x| x.get(node_idx))
+		.and_then(|x| x.iter().filter(|x| !matches!(x, NodeProblem::Crash)).next())
+		.is_some();
+	
+	let mut bad_child = false;
+	for c in node.children() {
+		*node_idx += 1;
+		bad_child = bad_child ||
+			collect_freq_info(plan_idx, node_idx, c.clone(),
+							  problems, node_freqs, pred_freqs, root_only);
+	}
+	let true_has_problem = has_problem;
+	if root_only && bad_child {
+		has_problem = false;
+	}
+	if let Some(entry) = node_freqs.get_mut(node.name()) {
+		*entry = (entry.0 + if has_problem { 1 } else { 0 }, entry.1 + 1);
+	} else {
+		node_freqs.insert(node.name().to_string(), (if has_problem { 1 } else { 0 }, 1));
+	}
+	for pred_kind in get_pred_nodes(node.clone()) {
+		if let Some(entry) = pred_freqs.get_mut(&pred_kind) {
+			*entry = (entry.0 + if has_problem { 1 } else { 0 }, entry.1 + 1);
+		} else {
+			pred_freqs.insert(pred_kind, (if has_problem { 1 } else { 0 }, 1));
+		}
+	}
+	return true_has_problem;
+}
+
 pub async fn analyze(
 	benches: impl Stream<Item = BenchmarkOutput>,
-	_cfg: AnalysisConfig
+	cfg: AnalysisConfig
 ) -> Report {
 	let queries: Vec<QueryReport> = benches.then(|bench| async move {	
 		let placement: Vec<_> = bench.plans.iter().enumerate()
@@ -231,8 +342,19 @@ pub async fn analyze(
 				}
 			}
 		}
+
+		let mut node_freq = HashMap::new();
+		let mut pred_freq = HashMap::new();
+		for (i, plan) in bench.plans.iter().enumerate() {
+			let mut node_idx = 0;
+			collect_freq_info(i, &mut node_idx, plan.plan.tree.clone(),
+							  &problems, &mut node_freq, &mut pred_freq,
+							  cfg.root_problems_only);
+		}
 		
 		QueryReport {
+			node_problem_frequency: node_freq,
+			pred_problem_frequency: pred_freq,
 			optimal_chosen: bench.chosen_idx == 0,
 			name: bench.name,
 			metrics: bench.metrics,
@@ -279,7 +401,9 @@ mod tests {
 	}
 
 	// Helper function to create a test MeasuredPlan
-	fn create_measured_plan(runtime_ms: u64, est_cost: f64, est_card: f64, act_card: usize) -> MeasuredPlan {
+	fn create_measured_plan(
+		runtime_ms: u64, est_cost: f64, est_card: f64, act_card: usize
+	) -> MeasuredPlan {
 		let plan_tree = create_test_plan();
 		MeasuredPlan {
 			plan: Plan::new(plan_tree, vec![est_cost], vec![est_card]),
@@ -432,6 +556,8 @@ mod tests {
 	fn test_report() {
 		// Create a basic report
 		let query1 = QueryReport {
+			node_problem_frequency: HashMap::new(),
+			pred_problem_frequency: HashMap::new(),
 			optimal_chosen: true,
 			name: "query1".to_string(),
 			metrics: OptimizerMetrics {
@@ -446,6 +572,8 @@ mod tests {
 		};
 		
 		let query2 = QueryReport {
+			node_problem_frequency: HashMap::new(),
+			pred_problem_frequency: HashMap::new(),
 			optimal_chosen: false,
 			name: "query2".to_string(),
 			metrics: OptimizerMetrics {

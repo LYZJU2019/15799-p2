@@ -23,16 +23,18 @@ async fn main() -> anyhow::Result<()> {
         // 1. Execute from top to bottom, skip all child nodes if parent node times out
         // 2. Added panic catching to prevent Arrow library errors from crashing the program
         // 3. Added hard timeout to ensure the task will terminate
-        timeout: Some(std::time::Duration::from_secs(1)),
+        timeout: Some(std::time::Duration::from_secs(7)),
         fast: false,
         enable_cache: true, // Enable plan caching to avoid re-running identical plans
-        num_runs: 5, // Run each plan 5 times to get statistical significance
-        drop_outliers: true, // Drop highest and lowest measurements to reduce noise
+        num_runs: 2, // Run each plan 5 times to get statistical significance
+        drop_outliers: false, // Drop highest and lowest measurements to reduce noise
         overlap_threshold: 0.5, // Consider runtimes equal if their ranges overlap by 50%
 		early_stopping: true, // Skip measuring subplans of failing plans
     };
 
-    let a_cfg = AnalysisConfig;
+    let a_cfg = AnalysisConfig {
+		root_problems_only: true,
+	};
 
     let config = SessionConfig::default();
     let df_ctx = SessionContext::new_with_config(config);
@@ -92,7 +94,7 @@ async fn main() -> anyhow::Result<()> {
 						tables.clone(),
 						table_paths,
 						SampleStrategy::RuleBased(RuleBailStrategy::Never),
-						true,
+						false,
 					)
 						.await?,
 				),
